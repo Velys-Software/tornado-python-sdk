@@ -392,6 +392,155 @@ async def test_configure_s3(client):
     await client.close()
 
 
+# =============================================================================
+# Defensive parsing tests (regression for null/empty bodies)
+# =============================================================================
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_success_null_body_does_not_crash(client):
+    """A literal JSON `null` on a 200 should be coerced to {} instead of crashing."""
+    respx.delete(f"{BASE_URL}/jobs/abc/file").mock(
+        return_value=httpx.Response(200, content=b"null", headers={"Content-Type": "application/json"})
+    )
+    result = await client.delete_job_file("abc")
+    assert result == {}
+    await client.close()
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_success_204_no_content_does_not_crash(client):
+    """An empty 204 body should be coerced to {} instead of raising on response.json()."""
+    respx.delete(f"{BASE_URL}/jobs/abc/file").mock(
+        return_value=httpx.Response(204)
+    )
+    result = await client.delete_job_file("abc")
+    assert result == {}
+    await client.close()
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_error_null_body_does_not_crash(client):
+    """A 500 with literal JSON `null` body must surface as TornadoAPIError, not AttributeError."""
+    from tornado_sdk.exceptions import TornadoAPIError
+
+    respx.get(f"{BASE_URL}/jobs/abc").mock(
+        return_value=httpx.Response(500, content=b"null", headers={"Content-Type": "application/json"})
+    )
+    with pytest.raises(TornadoAPIError) as exc_info:
+        await client.get_job("abc")
+    assert exc_info.value.status_code == 500
+    # message falls back to "HTTP 500" when no error key is present
+    assert "500" in str(exc_info.value)
+    await client.close()
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_error_plain_text_body(client):
+    """Non-JSON error bodies (e.g. gateway HTML) should surface as TornadoAPIError with the text."""
+    from tornado_sdk.exceptions import TornadoAPIError
+
+    respx.get(f"{BASE_URL}/jobs/abc").mock(
+        return_value=httpx.Response(502, text="Bad Gateway")
+    )
+    with pytest.raises(TornadoAPIError) as exc_info:
+        await client.get_job("abc")
+    assert exc_info.value.status_code == 502
+    assert "Bad Gateway" in str(exc_info.value)
+    await client.close()
+
+
+# =============================================================================
+# wait_for_job NotFound grace period (regression for create→read race)
+# =============================================================================
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_wait_for_job_tolerates_transient_404(client, monkeypatch):
+    """wait_for_job should poll through a transient 404 within the grace period."""
+    # Avoid actually sleeping in tests
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    import asyncio as _asyncio
+
+    monkeypatch.setattr(_asyncio, "sleep", _no_sleep)
+
+    # First call -> 404, second call -> Completed
+    route = respx.get(f"{BASE_URL}/jobs/abc").mock(
+        side_effect=[
+            httpx.Response(404, json={"error": "Job not found"}),
+            httpx.Response(
+                200,
+                json={"id": "abc", "url": "u", "status": "Completed"},
+            ),
+        ]
+    )
+    job = await client.wait_for_job("abc", poll_interval=0.0, not_found_grace_period=10.0)
+    assert job.is_completed
+    assert route.call_count == 2
+    await client.close()
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_wait_for_job_propagates_404_after_grace(client, monkeypatch):
+    """With grace_period=0, a 404 should propagate immediately."""
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    import asyncio as _asyncio
+    monkeypatch.setattr(_asyncio, "sleep", _no_sleep)
+
+    respx.get(f"{BASE_URL}/jobs/missing").mock(
+        return_value=httpx.Response(404, json={"error": "Job not found"})
+    )
+    with pytest.raises(NotFoundError):
+        await client.wait_for_job("missing", poll_interval=0.0, not_found_grace_period=0.0)
+    await client.close()
+
+
+# =============================================================================
+# Network error wrapping (regression for opaque [HTTP 0] messages)
+# =============================================================================
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_network_error_message_includes_method_path_and_type(client):
+    """Wrapped httpx errors should include method, path and exception type for debugging."""
+    from tornado_sdk.exceptions import TornadoAPIError
+
+    respx.post(f"{BASE_URL}/metadata").mock(side_effect=httpx.ReadError("connection reset"))
+
+    with pytest.raises(TornadoAPIError) as exc_info:
+        await client.get_metadata("https://youtube.com/watch?v=abc")
+    msg = str(exc_info.value)
+    assert "POST" in msg
+    assert "/metadata" in msg
+    assert exc_info.value.status_code == 0
+    await client.close()
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_network_error_falls_back_to_class_name_when_str_empty(client):
+    """If str(exc) is empty, the wrapper should still surface the exception class name."""
+    from tornado_sdk.exceptions import TornadoAPIError
+
+    # ReadError("") yields an empty str(e) — the class name is the only useful clue
+    respx.post(f"{BASE_URL}/metadata").mock(side_effect=httpx.ReadError(""))
+    with pytest.raises(TornadoAPIError) as exc_info:
+        await client.get_metadata("https://youtube.com/watch?v=abc")
+    assert "ReadError" in str(exc_info.value)
+    await client.close()
+
+
 @respx.mock
 @pytest.mark.asyncio
 async def test_configure_slack(client):
@@ -409,3 +558,144 @@ async def test_configure_slack(client):
     )
     assert "message" in result
     await client.close()
+
+
+# =============================================================================
+# bulk_youtube_jobs (fan-out around create_job)
+# =============================================================================
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_bulk_youtube_jobs_returns_job_ids_in_order(client):
+    """bulk_youtube_jobs should fan out POST /jobs and return job_ids in input order."""
+    seen_urls: list[str] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        import json as _json
+        body = _json.loads(request.content)
+        seen_urls.append(body["url"])
+        # synthesize a job_id from the URL suffix
+        return httpx.Response(201, json={"job_id": f"job-{body['url'][-1]}"})
+
+    respx.post(f"{BASE_URL}/jobs").mock(side_effect=_handler)
+
+    urls = [
+        "https://youtube.com/watch?v=A",
+        "https://youtube.com/watch?v=B",
+        "https://youtube.com/watch?v=C",
+    ]
+    ids = await client.bulk_youtube_jobs(urls, concurrency=2, folder="test")
+    assert ids == ["job-A", "job-B", "job-C"]
+    # all three input URLs were submitted
+    assert sorted(seen_urls) == sorted(urls)
+    await client.close()
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_bulk_youtube_jobs_return_exceptions(client):
+    """With return_exceptions=True, failed creations should be returned as Exceptions."""
+    from tornado_sdk import BulkJobItem
+
+    responses = [
+        httpx.Response(201, json={"job_id": "ok-1"}),
+        httpx.Response(400, json={"error": "Invalid URL"}),
+    ]
+    respx.post(f"{BASE_URL}/jobs").mock(side_effect=responses)
+
+    results = await client.bulk_youtube_jobs(
+        [BulkJobItem(url="https://youtube.com/watch?v=X", filename="x"), "not-a-url"],
+        concurrency=1,
+        return_exceptions=True,
+    )
+    assert results[0] == "ok-1"
+    assert isinstance(results[1], Exception)
+    await client.close()
+
+
+# =============================================================================
+# Job model exposes s3_key / s3_bucket / storage_provider
+# =============================================================================
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_get_job_exposes_s3_key_and_bucket(client):
+    """Job.from_dict should populate s3_key/s3_bucket/storage_provider when present."""
+    respx.get(f"{BASE_URL}/jobs/abc").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "abc",
+                "url": "https://youtube.com/watch?v=abc",
+                "status": "Completed",
+                "s3_url": "https://r2.example.com/tornado/videos/test/file.mp4?sig=...",
+                "s3_key": "videos/test/file.mp4",
+                "s3_bucket": "my-bucket",
+                "storage_provider": "s3",
+            },
+        )
+    )
+    job = await client.get_job("abc")
+    assert job.s3_key == "videos/test/file.mp4"
+    assert job.s3_bucket == "my-bucket"
+    assert job.storage_provider == "s3"
+    await client.close()
+
+
+# =============================================================================
+# Synchronous wrappers (#6) — smoke tests
+# =============================================================================
+
+
+@respx.mock
+def test_sync_wrappers_smoke():
+    """Smoke test that the new sync wrappers hit the right endpoints."""
+    from tornado_sdk import S3StorageConfig
+
+    sync_client = TornadoClient(api_key="test-key", max_retries=0)
+    with sync_client as c:
+        respx.post(f"{BASE_URL}/user/s3").mock(
+            return_value=httpx.Response(200, json={"message": "OK", "provider": "s3"})
+        )
+        result = c.sync_configure_s3(
+            S3StorageConfig(
+                endpoint="https://s3.amazonaws.com",
+                bucket="b",
+                region="us-east-1",
+                access_key="AK",
+                secret_key="SK",
+            )
+        )
+        assert result["provider"] == "s3"
+
+        respx.delete(f"{BASE_URL}/user/s3").mock(
+            return_value=httpx.Response(200, json={"message": "deleted"})
+        )
+        assert c.sync_delete_s3()["message"] == "deleted"
+
+        respx.post(f"{BASE_URL}/batch/b1/start").mock(
+            return_value=httpx.Response(200, json={"batch_id": "b1", "started_jobs": 5, "status": "processing"})
+        )
+        assert c.sync_start_batch("b1")["started_jobs"] == 5
+
+        respx.patch(f"{BASE_URL}/batch/b1/jobs").mock(
+            return_value=httpx.Response(200, json={"updated": 1, "errors": []})
+        )
+        result = c.sync_rename_batch_jobs("b1", [{"job_id": "j1", "filename": "ep1"}])
+        assert result["updated"] == 1
+
+
+@respx.mock
+def test_sync_context_manager_closes_sync_client():
+    """The synchronous context manager should close the sync client on exit."""
+    respx.get(f"{BASE_URL}/usage").mock(
+        return_value=httpx.Response(200, json={"client_name": "t", "usage_count": 0, "storage_usage_gb": 0.0})
+    )
+    with TornadoClient(api_key="k", max_retries=0) as c:
+        c.sync_get_usage()
+        assert c._sync_client is not None
+        assert not c._sync_client.is_closed
+    # After exiting the context manager, the sync client must be closed.
+    assert c._sync_client.is_closed

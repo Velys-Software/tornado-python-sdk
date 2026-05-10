@@ -310,48 +310,84 @@ class Job:
         - ``is_failed``: True if status == Failed
         - ``is_terminal``: True if the job won't change state anymore
         - ``s3_url``: Download URL for the output file (available when completed)
+
+    Field stability contract:
+        Fields are grouped into PUBLIC (stable contract) and INTERNAL
+        (subject to change without notice). Consumers building durable
+        artifacts (datasets, archives, dashboards) should rely only on
+        PUBLIC fields.
+
+        PUBLIC (stable):
+            id, url, status, s3_url, subtitle_url, error, error_type,
+            title, file_size, created_at, finished_at, folder, batch_id,
+            and the user-parameter echo block (filename, format,
+            video_codec, audio_codec, audio_bitrate, video_quality,
+            audio_only, download_subtitles, download_thumbnail,
+            quality_preset, max_resolution, clip_start, clip_end,
+            live_recording, live_from_start, max_duration, wait_for_video,
+            enable_progress_webhook, marketplace_source, description,
+            release_date).
+
+        INTERNAL (telemetry, may be renamed/removed in any release):
+            step, all *_duration_ms / *_wait_ms / *_speed_mbps fields,
+            download_strategy, cascade_total_attempts, native_video_codec,
+            native_audio_codec, download_retries, upload_retries,
+            requested_quality, actual_quality, webhook_status.
     """
 
-    # -- Core fields (always present) -----------------------------------------
+    # -- PUBLIC: Core fields (always present) ---------------------------------
     id: str                                  # Unique job UUID
     url: str                                 # Original video URL
     status: JobStatus                        # Current pipeline stage
 
-    # -- Output fields (populated on completion) ------------------------------
+    # -- PUBLIC: Output fields (populated on completion) ----------------------
     s3_url: Optional[str] = None             # Presigned download URL for the output file
+    # Real object key + bucket + provider, when the API returns them.
+    # The path encoded in the presigned ``s3_url`` may include extra prefixes
+    # (e.g. ``tornado/``) that do NOT match the actual object key in your
+    # bucket. Use these fields to derive sibling keys (sidecars, manifests)
+    # rather than parsing the presigned URL.
+    s3_key: Optional[str] = None             # PUBLIC — exact object key in the bucket
+    s3_bucket: Optional[str] = None          # PUBLIC — destination bucket name
+    storage_provider: Optional[str] = None   # PUBLIC — "s3" | "blob" | "gcs" | "oss" | ...
     subtitle_url: Optional[str] = None       # Presigned URL for subtitle file (if requested)
     error: Optional[str] = None              # Error message (if failed)
     error_type: Optional[str] = None         # "error" for technical, "warning" for content issues
-    step: Optional[str] = None               # Current pipeline step description
+    step: Optional[str] = None               # INTERNAL — current pipeline step description (UI hint)
     title: Optional[str] = None              # Video title extracted from source
 
-    # -- Performance metrics (populated progressively) ------------------------
-    download_speed_mbps: Optional[float] = None    # Download speed in Mbps
-    upload_speed_mbps: Optional[float] = None      # Upload speed to storage in Mbps
-    extract_duration_ms: Optional[int] = None      # Time to extract stream info
-    download_duration_ms: Optional[int] = None     # Time to download streams
-    mux_duration_ms: Optional[int] = None          # Time for FFmpeg muxing
-    upload_duration_ms: Optional[int] = None       # Time to upload to storage
-    total_duration_ms: Optional[int] = None        # Total wall-clock time
-    precheck_duration_ms: Optional[int] = None     # YouTube API pre-check time
-    io_wait_ms: Optional[int] = None               # Time waiting for IO semaphore
-    cpu_wait_ms: Optional[int] = None              # Time waiting for CPU semaphore
-    upload_wait_ms: Optional[int] = None           # Time waiting for upload semaphore
-    download_strategy: Optional[str] = None        # Which download method was used
-    cascade_total_attempts: Optional[int] = None   # Total cascade fallback attempts
-    subtitle_duration_ms: Optional[int] = None     # Time to download subtitles
-    file_move_ms: Optional[int] = None             # Time to move temp files
-    file_size: Optional[int] = None                # Output file size in bytes
-    native_video_codec: Optional[str] = None       # Original video codec from source
-    native_audio_codec: Optional[str] = None       # Original audio codec from source
-    download_retries: Optional[int] = None         # Number of download retry attempts
-    upload_retries: Optional[int] = None           # Number of upload retry attempts
-    queue_wait_ms: Optional[int] = None            # Time spent waiting in queue
-    requested_quality: Optional[str] = None        # Quality that was requested
-    actual_quality: Optional[str] = None           # Quality that was actually downloaded
-    webhook_status: Optional[str] = None           # Webhook delivery status
-    created_at: Optional[int] = None               # Job creation timestamp (epoch ms)
-    finished_at: Optional[int] = None              # Job completion timestamp (epoch ms)
+    # -- INTERNAL: Performance / telemetry (subject to change) ----------------
+    # These are useful for debugging and observability but are not part of
+    # the public contract. Field names and presence may change between releases.
+    download_speed_mbps: Optional[float] = None    # INTERNAL
+    upload_speed_mbps: Optional[float] = None      # INTERNAL
+    extract_duration_ms: Optional[int] = None      # INTERNAL
+    download_duration_ms: Optional[int] = None     # INTERNAL
+    mux_duration_ms: Optional[int] = None          # INTERNAL
+    upload_duration_ms: Optional[int] = None       # INTERNAL
+    total_duration_ms: Optional[int] = None        # INTERNAL — total wall-clock time
+    precheck_duration_ms: Optional[int] = None     # INTERNAL
+    io_wait_ms: Optional[int] = None               # INTERNAL
+    cpu_wait_ms: Optional[int] = None              # INTERNAL
+    upload_wait_ms: Optional[int] = None           # INTERNAL
+    download_strategy: Optional[str] = None        # INTERNAL
+    cascade_total_attempts: Optional[int] = None   # INTERNAL
+    subtitle_duration_ms: Optional[int] = None     # INTERNAL
+    file_move_ms: Optional[int] = None             # INTERNAL
+    # PUBLIC again
+    file_size: Optional[int] = None                # PUBLIC — output file size in bytes
+    # INTERNAL block
+    native_video_codec: Optional[str] = None       # INTERNAL
+    native_audio_codec: Optional[str] = None       # INTERNAL
+    download_retries: Optional[int] = None         # INTERNAL
+    upload_retries: Optional[int] = None           # INTERNAL
+    queue_wait_ms: Optional[int] = None            # INTERNAL
+    requested_quality: Optional[str] = None        # INTERNAL
+    actual_quality: Optional[str] = None           # INTERNAL
+    webhook_status: Optional[str] = None           # INTERNAL
+    # PUBLIC timestamps
+    created_at: Optional[int] = None               # PUBLIC — epoch ms
+    finished_at: Optional[int] = None              # PUBLIC — epoch ms
 
     # -- User-provided parameters echoed back ---------------------------------
     description: Optional[str] = None              # Spotify episode description
@@ -396,6 +432,9 @@ class Job:
             url=data.get("url", ""),
             status=status,
             s3_url=data.get("s3_url"),
+            s3_key=data.get("s3_key") or data.get("object_key") or data.get("key"),
+            s3_bucket=data.get("s3_bucket") or data.get("bucket"),
+            storage_provider=data.get("storage_provider") or data.get("provider"),
             subtitle_url=data.get("subtitle_url"),
             error=data.get("error"),
             error_type=data.get("error_type"),

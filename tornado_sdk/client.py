@@ -184,7 +184,9 @@ class TornadoClient:
                     await asyncio.sleep(2 ** attempt)
                     last_exc = e
                     continue
-                raise TornadoAPIError(str(e), 0) from e
+                raise TornadoAPIError(
+                    self._format_network_error(method, path, e), 0
+                ) from e
 
         # All retries exhausted — raise the last error
         raise last_exc  # type: ignore[misc]
@@ -224,28 +226,53 @@ class TornadoClient:
                     time.sleep(2 ** attempt)
                     last_exc = e
                     continue
-                raise TornadoAPIError(str(e), 0) from e
+                raise TornadoAPIError(
+                    self._format_network_error(method, path, e), 0
+                ) from e
 
         raise last_exc  # type: ignore[misc]
+
+    @staticmethod
+    def _format_network_error(method: str, path: str, exc: Exception) -> str:
+        """Format a network-level exception into a debuggable message.
+
+        ``str(exc)`` is often empty for low-level httpx errors (ReadError,
+        RemoteProtocolError) — fall back to the exception class name so the
+        caller still has a useful clue.
+        """
+        detail = str(exc) or type(exc).__name__
+        return f"Network error on {method} {path}: {detail}"
 
     @staticmethod
     def _handle_response(response: httpx.Response) -> dict[str, Any]:
         """Parse API response and raise typed exceptions for error status codes.
 
-        Success (200, 201): Returns parsed JSON body.
+        Success (200, 201, 204): Returns parsed JSON body, or {} if the body is
+        empty / null / not a JSON object.
         Errors: Raises the appropriate TornadoAPIError subclass.
         """
-        # Success responses
-        if response.status_code in (200, 201):
-            return response.json()
+        def _safe_json() -> Any:
+            # Empty body (e.g. 204 No Content) — json() would raise
+            if not response.content:
+                return None
+            try:
+                return response.json()
+            except Exception:
+                return None
 
-        # Parse error body (API always returns JSON with "error" key)
-        try:
-            body = response.json()
-        except Exception:
-            body = {"error": response.text}
+        # Success responses — coerce non-dict bodies (None, list, scalar) to {}
+        # so callers can rely on the dict[str, Any] return contract.
+        if response.status_code in (200, 201, 204):
+            body = _safe_json()
+            return body if isinstance(body, dict) else {}
 
-        error_msg = body.get("error", f"HTTP {response.status_code}")
+        # Error path — body may be None, a non-dict, or a plain text error
+        body = _safe_json()
+        if not isinstance(body, dict):
+            text = (response.text or "").strip()
+            body = {"error": text or f"HTTP {response.status_code}"}
+
+        error_msg = body.get("error") or f"HTTP {response.status_code}"
 
         # Map HTTP status codes to specific exception types
         if response.status_code in (401, 403):
@@ -281,6 +308,16 @@ class TornadoClient:
         if self._sync_client and not self._sync_client.is_closed:
             self._sync_client.close()
 
+    def sync_close(self) -> None:
+        """Close the synchronous HTTP client only.
+
+        Use this from synchronous code where ``close()`` (async) cannot be
+        awaited. The async client, if it was lazily created, must still be
+        closed via ``await close()`` from an event loop.
+        """
+        if self._sync_client and not self._sync_client.is_closed:
+            self._sync_client.close()
+
     async def __aenter__(self) -> TornadoClient:
         """Enter async context manager."""
         return self
@@ -288,6 +325,14 @@ class TornadoClient:
     async def __aexit__(self, *args: Any) -> None:
         """Exit async context manager — closes HTTP clients."""
         await self.close()
+
+    def __enter__(self) -> TornadoClient:
+        """Enter synchronous context manager (``with TornadoClient(...) as client:``)."""
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        """Exit synchronous context manager — closes the sync HTTP client."""
+        self.sync_close()
 
     # =========================================================================
     # Jobs — Single Video Downloads
@@ -471,6 +516,7 @@ class TornadoClient:
         *,
         poll_interval: float = 2.0,
         timeout: Optional[float] = None,
+        not_found_grace_period: float = 30.0,
     ) -> Job:
         """Poll a job until it reaches a terminal state (Completed/Failed/Cancelled).
 
@@ -481,16 +527,27 @@ class TornadoClient:
             job_id: The UUID of the job to wait for.
             poll_interval: Seconds between status checks. Default: 2.0.
             timeout: Maximum seconds to wait. None means wait indefinitely.
+            not_found_grace_period: Seconds to keep polling on NotFoundError
+                before propagating it. Tolerates a create-then-read replication
+                lag where get_job() briefly 404s right after create_job().
+                Set to 0.0 to disable. Default: 30.0.
 
         Returns:
             The final Job object in its terminal state.
 
         Raises:
             TimeoutError: If the timeout is reached before the job completes.
+            NotFoundError: If the job is still missing after the grace period.
         """
         start = time.monotonic()
         while True:
-            job = await self.get_job(job_id)
+            try:
+                job = await self.get_job(job_id)
+            except NotFoundError:
+                if (time.monotonic() - start) < not_found_grace_period:
+                    await asyncio.sleep(poll_interval)
+                    continue
+                raise
             if job.is_terminal:
                 return job
             if timeout and (time.monotonic() - start) >= timeout:
@@ -529,6 +586,15 @@ class TornadoClient:
 
         All jobs share the same encoding options but can have individual filenames.
         Accepts a flexible list of URLs, BulkJobItem objects, or dicts.
+
+        .. warning::
+            This endpoint is primarily designed for **Spotify show batches**.
+            For non-Spotify URLs (e.g. plain YouTube), the returned ``batch_id``
+            and ``job_ids`` may not be addressable via ``get_job()`` /
+            ``get_batch()`` / ``start_batch()``. If you only have YouTube URLs,
+            use :meth:`bulk_youtube_jobs` instead, which fans out individual
+            ``create_job()`` calls under a concurrency limit and returns
+            normal job IDs that work with the standard endpoints.
 
         Args:
             jobs: List of video URLs. Each item can be:
@@ -576,6 +642,62 @@ class TornadoClient:
             wait_for_video=wait_for_video,
         )
         return await self._request("POST", "/jobs/bulk", json=req.to_dict())
+
+    async def bulk_youtube_jobs(
+        self,
+        urls: list[Union[str, BulkJobItem, dict[str, Any]]],
+        *,
+        concurrency: int = 8,
+        return_exceptions: bool = False,
+        **job_kwargs: Any,
+    ) -> list[Union[str, Exception]]:
+        """Fan out ``create_job()`` calls for a list of YouTube URLs.
+
+        Workaround for the limitation documented on :meth:`create_bulk_jobs`:
+        the ``/jobs/bulk`` endpoint returns IDs that are not addressable via
+        ``get_job()`` for non-Spotify URLs. This helper instead invokes
+        ``POST /jobs`` once per URL — under an ``asyncio.Semaphore`` to bound
+        concurrency — and returns plain job IDs that work with all standard
+        job endpoints.
+
+        Args:
+            urls: List of URLs. Each item can be a string, a ``BulkJobItem``
+                (to override ``filename``), or a dict with ``url`` / ``filename``.
+            concurrency: Maximum concurrent ``create_job`` calls. Default: 8.
+            return_exceptions: If True, failed creations are returned as
+                Exception objects in the result list (same index as the input).
+                If False (default), the first failure is raised.
+            **job_kwargs: Forwarded as keyword arguments to ``create_job``
+                (e.g. ``folder``, ``audio_only``, ``download_thumbnail``,
+                ``storage``, …). Per-item ``filename`` from BulkJobItem/dict
+                overrides any ``filename`` passed in ``job_kwargs``.
+
+        Returns:
+            List of job_ids (str) in the same order as the input. When
+            ``return_exceptions=True``, failed items are Exception objects.
+        """
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def _one(item: Union[str, BulkJobItem, dict[str, Any]]) -> str:
+            if isinstance(item, str):
+                url, per_item_filename = item, None
+            elif isinstance(item, BulkJobItem):
+                url, per_item_filename = item.url, item.filename
+            elif isinstance(item, dict):
+                url, per_item_filename = item["url"], item.get("filename")
+            else:
+                raise ValueError(f"Invalid job item type: {type(item)}")
+
+            kwargs = dict(job_kwargs)
+            if per_item_filename is not None:
+                kwargs["filename"] = per_item_filename
+            async with semaphore:
+                return await self.create_job(url, **kwargs)
+
+        results = await asyncio.gather(
+            *(_one(u) for u in urls), return_exceptions=return_exceptions
+        )
+        return list(results)
 
     # =========================================================================
     # Batch Operations — Spotify Shows
@@ -633,6 +755,7 @@ class TornadoClient:
         *,
         poll_interval: float = 5.0,
         timeout: Optional[float] = None,
+        not_found_grace_period: float = 30.0,
     ) -> BatchJob:
         """Poll a batch until all episodes are done (completed or failed).
 
@@ -640,16 +763,27 @@ class TornadoClient:
             batch_id: The batch UUID.
             poll_interval: Seconds between status checks. Default: 5.0.
             timeout: Maximum seconds to wait. None means wait indefinitely.
+            not_found_grace_period: Seconds to keep polling on NotFoundError
+                before propagating it. Tolerates a create-then-read replication
+                lag right after the batch was created. Set to 0.0 to disable.
+                Default: 30.0.
 
         Returns:
             The final BatchJob object with episode completion counts.
 
         Raises:
             TimeoutError: If timeout is reached before the batch finishes.
+            NotFoundError: If the batch is still missing after the grace period.
         """
         start = time.monotonic()
         while True:
-            batch = await self.get_batch(batch_id)
+            try:
+                batch = await self.get_batch(batch_id)
+            except NotFoundError:
+                if (time.monotonic() - start) < not_found_grace_period:
+                    await asyncio.sleep(poll_interval)
+                    continue
+                raise
             # Check if batch is done (all episodes processed)
             if batch.is_completed or batch.status in ("completed", "failed"):
                 return batch
@@ -904,14 +1038,22 @@ class TornadoClient:
         *,
         poll_interval: float = 2.0,
         timeout: Optional[float] = None,
+        not_found_grace_period: float = 30.0,
     ) -> Job:
         """Synchronous version of ``wait_for_job()``.
 
         Blocks the current thread until the job reaches a terminal state.
+        See ``wait_for_job()`` for ``not_found_grace_period`` semantics.
         """
         start_t = time.monotonic()
         while True:
-            job = self.sync_get_job(job_id)
+            try:
+                job = self.sync_get_job(job_id)
+            except NotFoundError:
+                if (time.monotonic() - start_t) < not_found_grace_period:
+                    time.sleep(poll_interval)
+                    continue
+                raise
             if job.is_terminal:
                 return job
             if timeout and (time.monotonic() - start_t) >= timeout:
@@ -919,3 +1061,119 @@ class TornadoClient:
                     f"Job {job_id} did not complete within {timeout}s (status: {job.status.value})"
                 )
             time.sleep(poll_interval)
+
+    def sync_create_job_full(self, url: str, **kwargs: Any) -> dict[str, Any]:
+        """Synchronous version of ``create_job_full()``. Returns the raw API response."""
+        req = CreateJobRequest(url=url, **kwargs)
+        return self._request_sync("POST", "/jobs", json=req.to_dict())
+
+    def sync_start_batch(self, batch_id: str) -> dict[str, Any]:
+        """Synchronous version of ``start_batch()``."""
+        return self._request_sync("POST", f"/batch/{batch_id}/start")
+
+    def sync_rename_batch_jobs(
+        self, batch_id: str, renames: list[dict[str, str]]
+    ) -> dict[str, Any]:
+        """Synchronous version of ``rename_batch_jobs()``."""
+        return self._request_sync(
+            "PATCH", f"/batch/{batch_id}/jobs", json={"renames": renames}
+        )
+
+    def sync_wait_for_batch(
+        self,
+        batch_id: str,
+        *,
+        poll_interval: float = 5.0,
+        timeout: Optional[float] = None,
+        not_found_grace_period: float = 30.0,
+    ) -> BatchJob:
+        """Synchronous version of ``wait_for_batch()``.
+
+        Blocks the current thread until all batch episodes reach a terminal state.
+        """
+        start_t = time.monotonic()
+        while True:
+            try:
+                batch = self.sync_get_batch(batch_id)
+            except NotFoundError:
+                if (time.monotonic() - start_t) < not_found_grace_period:
+                    time.sleep(poll_interval)
+                    continue
+                raise
+            if batch.is_completed or batch.status in ("completed", "failed"):
+                return batch
+            done = batch.completed_episodes + batch.failed_episodes
+            if done >= batch.total_episodes and batch.total_episodes > 0:
+                return batch
+            if timeout and (time.monotonic() - start_t) >= timeout:
+                raise TimeoutError(
+                    f"Batch {batch_id} did not complete within {timeout}s"
+                )
+            time.sleep(poll_interval)
+
+    # -- Storage configuration sync wrappers ----------------------------------
+
+    def sync_configure_s3(self, config: S3StorageConfig) -> dict[str, Any]:
+        """Synchronous version of ``configure_s3()``."""
+        return self._request_sync("POST", "/user/s3", json=config.to_dict())
+
+    def sync_delete_s3(self) -> dict[str, Any]:
+        """Synchronous version of ``delete_s3()``."""
+        return self._request_sync("DELETE", "/user/s3")
+
+    def sync_configure_blob(self, config: BlobStorageConfig) -> dict[str, Any]:
+        """Synchronous version of ``configure_blob()``."""
+        return self._request_sync("POST", "/user/blob", json=config.to_dict())
+
+    def sync_delete_blob(self) -> dict[str, Any]:
+        """Synchronous version of ``delete_blob()``."""
+        return self._request_sync("DELETE", "/user/blob")
+
+    def sync_configure_gcs(self, config: GcsStorageConfig) -> dict[str, Any]:
+        """Synchronous version of ``configure_gcs()``."""
+        return self._request_sync("POST", "/user/gcs", json=config.to_dict())
+
+    def sync_delete_gcs(self) -> dict[str, Any]:
+        """Synchronous version of ``delete_gcs()``."""
+        return self._request_sync("DELETE", "/user/gcs")
+
+    def sync_configure_oss(self, config: OssStorageConfig) -> dict[str, Any]:
+        """Synchronous version of ``configure_oss()``."""
+        return self._request_sync("POST", "/user/oss", json=config.to_dict())
+
+    def sync_delete_oss(self) -> dict[str, Any]:
+        """Synchronous version of ``delete_oss()``."""
+        return self._request_sync("DELETE", "/user/oss")
+
+    def sync_configure_bucket(
+        self,
+        endpoint: str,
+        bucket: str,
+        region: str,
+        access_key: str,
+        secret_key: str,
+    ) -> dict[str, Any]:
+        """Synchronous version of ``configure_bucket()`` (legacy S3 endpoint)."""
+        return self._request_sync(
+            "POST",
+            "/user/bucket",
+            json={
+                "endpoint": endpoint,
+                "bucket": bucket,
+                "region": region,
+                "access_key": access_key,
+                "secret_key": secret_key,
+            },
+        )
+
+    def sync_delete_bucket(self) -> dict[str, Any]:
+        """Synchronous version of ``delete_bucket()``."""
+        return self._request_sync("DELETE", "/user/bucket")
+
+    def sync_configure_slack(self, config: SlackWebhookConfig) -> dict[str, Any]:
+        """Synchronous version of ``configure_slack()``."""
+        return self._request_sync("POST", "/user/slack", json=config.to_dict())
+
+    def sync_delete_slack(self) -> dict[str, Any]:
+        """Synchronous version of ``delete_slack()``."""
+        return self._request_sync("DELETE", "/user/slack")
