@@ -133,8 +133,9 @@ job = await client.get_job(job_id)
 # Wait for completion with polling
 job = await client.wait_for_job(job_id, poll_interval=2.0, timeout=300)
 
-# List all jobs with filtering
-jobs, total = await client.list_jobs(limit=10, offset=0, status="Completed")
+# List all jobs with filtering (status is case-insensitive: pending, processing,
+# completed, failed, warning)
+jobs, total = await client.list_jobs(limit=10, offset=0, status="completed")
 
 # Cancel / Retry / Delete file
 await client.cancel_job(job_id)
@@ -144,21 +145,32 @@ await client.delete_job_file(job_id)
 
 ### Bulk YouTube Video Downloads
 
-Download up to 100 videos in a single API call — no rate limits, no blocked requests.
+For many plain video URLs (YouTube, TikTok, …), use `bulk_youtube_jobs()`. It fans
+out one job per URL under a concurrency limit and returns **normal job IDs** that
+work with `get_job()` / `wait_for_job()`.
 
 ```python
 from tornado_sdk import BulkJobItem
 
-result = await client.create_bulk_jobs(
-    jobs=[
+job_ids = await client.bulk_youtube_jobs(
+    [
         "https://youtube.com/watch?v=...",
         BulkJobItem(url="https://youtube.com/watch?v=...", filename="custom-name"),
     ],
+    concurrency=8,            # max concurrent downloads
     folder="my-playlist",
     max_resolution="1080",
 )
-# result = {"batch_id": "...", "total_jobs": 2, "job_ids": ["...", "..."]}
+# job_ids = ["...", "..."] — poll each with get_job() / wait_for_job()
+
+for job_id in job_ids:
+    job = await client.wait_for_job(job_id, timeout=600)
+    print(job_id, job.s3_url)
 ```
+
+> ⚠️ The server-side `create_bulk_jobs()` (`POST /jobs/bulk`) is designed for
+> **Spotify show batches**. For non-Spotify URLs the IDs it returns are **not**
+> addressable via `get_job()` — use `bulk_youtube_jobs()` for YouTube/TikTok/etc.
 
 ### Spotify Podcast Downloader (Batch)
 

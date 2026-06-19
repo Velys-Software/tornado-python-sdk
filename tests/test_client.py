@@ -121,6 +121,19 @@ async def test_list_jobs(client):
 
 @respx.mock
 @pytest.mark.asyncio
+async def test_list_jobs_lowercases_status_filter(client):
+    """The status filter must be sent lowercase to match the API contract."""
+    route = respx.get(f"{BASE_URL}/jobs").mock(
+        return_value=httpx.Response(200, json={"jobs": [], "total": 0})
+    )
+    # Caller passes the PascalCase Job.status value; the client must normalize it.
+    await client.list_jobs(status="Completed")
+    assert "status=completed" in str(route.calls[0].request.url)
+    await client.close()
+
+
+@respx.mock
+@pytest.mark.asyncio
 async def test_cancel_job(client):
     """DELETE /jobs/:id should return cancellation confirmation."""
     respx.delete(f"{BASE_URL}/jobs/abc-123").mock(

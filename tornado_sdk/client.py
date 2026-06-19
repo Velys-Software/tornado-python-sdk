@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, cast
 
 import httpx
 
@@ -478,7 +478,9 @@ class TornadoClient:
         Args:
             limit: Maximum number of jobs to return.
             offset: Number of jobs to skip (for pagination).
-            status: Filter by status (e.g., "Completed", "Failed", "Pending").
+            status: Filter by status (case-insensitive; normalized to lowercase
+                for the API). Valid values: "pending", "processing",
+                "completed", "failed", "warning".
 
         Returns:
             Tuple of (list of Job objects, total count).
@@ -489,7 +491,9 @@ class TornadoClient:
         if offset is not None:
             params["offset"] = offset
         if status is not None:
-            params["status"] = status
+            # The API expects lowercase status filters (pending, completed, ...);
+            # callers naturally pass the PascalCase Job.status value, so normalize.
+            params["status"] = status.lower()
 
         data = await self._request("GET", "/jobs", params=params)
         jobs = [Job.from_dict(j) for j in data.get("jobs", [])]
@@ -721,7 +725,10 @@ class TornadoClient:
         results = await asyncio.gather(
             *(_one(u) for u in urls), return_exceptions=return_exceptions
         )
-        return list(results)
+        # gather(return_exceptions=True) is typed as BaseException, but a failed
+        # create_job yields a TornadoError (an Exception). Preserve the
+        # documented list[str | Exception] contract.
+        return cast("list[Union[str, Exception]]", list(results))
 
     # =========================================================================
     # Batch Operations — Spotify Shows
@@ -994,14 +1001,17 @@ class TornadoClient:
         offset: Optional[int] = None,
         status: Optional[str] = None,
     ) -> tuple[list[Job], int]:
-        """Synchronous version of ``list_jobs()``. Returns (jobs, total)."""
+        """Synchronous version of ``list_jobs()``. Returns (jobs, total).
+
+        ``status`` is case-insensitive and normalized to lowercase for the API.
+        """
         params: dict[str, Any] = {}
         if limit is not None:
             params["limit"] = limit
         if offset is not None:
             params["offset"] = offset
         if status is not None:
-            params["status"] = status
+            params["status"] = status.lower()
         data = self._request_sync("GET", "/jobs", params=params)
         jobs = [Job.from_dict(j) for j in data.get("jobs", [])]
         return jobs, data.get("total", len(jobs))
