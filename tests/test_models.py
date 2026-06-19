@@ -15,6 +15,9 @@ from tornado_sdk.models import (
     MetadataResponse,
     UsageResponse,
     S3StorageConfig,
+    BlobStorageConfig,
+    GcsStorageConfig,
+    OssStorageConfig,
     InlineStorageConfig,
 )
 
@@ -118,16 +121,38 @@ def test_job_from_dict():
 
 
 def test_job_statuses():
-    """All known status values should parse correctly."""
-    for status_val in ["Pending", "Downloading", "Muxing", "Uploading", "Completed", "Failed", "Cancelled"]:
+    """All real API status values should parse correctly."""
+    for status_val in ["Pending", "Processing", "Completed", "Failed", "Warning", "Skipped", "Cancelled"]:
         job = Job.from_dict({"id": "x", "url": "u", "status": status_val})
         assert job.status == JobStatus(status_val)
 
 
-def test_job_unknown_status_defaults():
-    """Unknown status values from a newer API version should default to Pending."""
+def test_job_warning_and_skipped_are_terminal():
+    """Warning and Skipped are real terminal outcomes (regression for the wait_for_job hang)."""
+    warning = Job.from_dict({"id": "x", "url": "u", "status": "Warning"})
+    assert warning.is_warning
+    assert warning.is_terminal
+    assert not warning.is_completed
+
+    skipped = Job.from_dict({"id": "x", "url": "u", "status": "Skipped"})
+    assert skipped.is_skipped
+    assert skipped.is_terminal
+
+
+def test_job_processing_is_non_terminal():
+    """Processing must map to PROCESSING (not PENDING) and stay non-terminal."""
+    job = Job.from_dict({"id": "x", "url": "u", "status": "Processing"})
+    assert job.status == JobStatus.PROCESSING
+    assert not job.is_terminal
+
+
+def test_job_unknown_status_maps_to_sentinel_and_preserves_raw():
+    """Unknown statuses map to UNKNOWN (not PENDING) and keep the raw value, non-terminal."""
     job = Job.from_dict({"id": "x", "url": "u", "status": "SomethingNew"})
-    assert job.status == JobStatus.PENDING
+    assert job.status == JobStatus.UNKNOWN
+    assert job.raw_status == "SomethingNew"
+    # Non-terminal so a wait loop keeps polling rather than declaring a wrong outcome.
+    assert not job.is_terminal
 
 
 # =============================================================================
@@ -287,3 +312,77 @@ def test_inline_storage_oss():
     d = config.to_dict()
     assert d["provider"] == "oss"
     assert d["access_key_id"] == "AKID"
+
+
+# =============================================================================
+# Secret redaction in repr() — credentials must never leak into logs/tracebacks
+# =============================================================================
+
+
+def test_s3_config_repr_redacts_secrets():
+    """repr(S3StorageConfig) must not expose access_key/secret_key."""
+    cfg = S3StorageConfig(
+        endpoint="https://s3", bucket="b", region="r",
+        access_key="AKIA_PUBLIC", secret_key="TOPSECRET",
+    )
+    r = repr(cfg)
+    assert "TOPSECRET" not in r
+    assert "AKIA_PUBLIC" not in r
+    # to_dict() must still carry the real values for the wire.
+    assert cfg.to_dict()["secret_key"] == "TOPSECRET"
+
+
+def test_blob_config_repr_redacts_secrets():
+    """repr(BlobStorageConfig) must not expose account_key/sas_token."""
+    cfg = BlobStorageConfig(
+        account_name="acct", container="c",
+        account_key="ACCKEY", sas_token="SASTOKEN",
+    )
+    r = repr(cfg)
+    assert "ACCKEY" not in r
+    assert "SASTOKEN" not in r
+
+
+def test_gcs_config_repr_redacts_service_account_json():
+    """repr(GcsStorageConfig) must not expose the service-account private key JSON."""
+    cfg = GcsStorageConfig(
+        project_id="p", bucket="b",
+        service_account_json='{"private_key":"-----BEGIN PRIVATE KEY-----LEAK"}',
+    )
+    assert "LEAK" not in repr(cfg)
+
+
+def test_oss_config_repr_redacts_secrets():
+    """repr(OssStorageConfig) must not expose access_key_id/access_key_secret."""
+    cfg = OssStorageConfig(
+        endpoint="https://oss", bucket="b",
+        access_key_id="AKID", access_key_secret="AKSECRET",
+    )
+    r = repr(cfg)
+    assert "AKID" not in r
+    assert "AKSECRET" not in r
+
+
+def test_inline_storage_repr_redacts_but_keeps_provider():
+    """repr(InlineStorageConfig) redacts secrets yet stays useful (provider visible)."""
+    cfg = InlineStorageConfig.s3(
+        endpoint="https://s3", bucket="b", region="r",
+        access_key="AK", secret_key="INLINE_SECRET",
+    )
+    r = repr(cfg)
+    assert "INLINE_SECRET" not in r
+    assert "s3" in r  # provider tag still shown for debuggability
+    # The real secret is still serialized for the wire.
+    assert cfg.to_dict()["secret_key"] == "INLINE_SECRET"
+
+
+def test_create_job_request_repr_does_not_leak_inline_storage_secret():
+    """A CreateJobRequest carrying inline storage must not transitively dump the secret."""
+    req = CreateJobRequest(
+        url="https://youtube.com/watch?v=abc",
+        storage=InlineStorageConfig.s3(
+            endpoint="https://s3", bucket="b", region="r",
+            access_key="AK", secret_key="NESTED_SECRET",
+        ),
+    )
+    assert "NESTED_SECRET" not in repr(req)

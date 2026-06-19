@@ -25,6 +25,7 @@ from tornado_sdk.client import TornadoClient
 from tornado_sdk.models import (
     Job,
     JobStatus,
+    JobStep,
     CreateJobRequest,
     CreateBulkRequest,
     BulkJobItem,
@@ -60,6 +61,7 @@ __all__ = [
     # Models
     "Job",
     "JobStatus",
+    "JobStep",
     "CreateJobRequest",
     "CreateBulkRequest",
     "BulkJobItem",

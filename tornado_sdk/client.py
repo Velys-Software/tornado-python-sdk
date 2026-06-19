@@ -72,9 +72,12 @@ class TornadoClient:
             Uses exponential backoff (1s, 2s, 4s, ...). Default: 3.
         auth_mode: Authentication method: ``"api_key"`` or ``"bearer"``.
             Default: ``"api_key"``.
+        max_backoff: Upper bound (seconds) on any single retry sleep, including a
+            server-provided ``Retry-After``. Prevents an unbounded block from a
+            hostile or misconfigured gateway. Default: 60.
 
     Example (direct API):
-        >>> client = TornadoClient(api_key="tk_abc123")
+        >>> client = TornadoClient(api_key="sk_abc123")
 
     Example (Apify marketplace):
         >>> client = TornadoClient(api_key="apify_api_xxx", auth_mode="bearer")
@@ -87,11 +90,13 @@ class TornadoClient:
         timeout: float = 30.0,
         max_retries: int = 3,
         auth_mode: str = "api_key",
+        max_backoff: float = 60.0,
     ) -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.max_retries = max_retries
+        self.max_backoff = max_backoff
         # "api_key" sends x-api-key header; "bearer" sends Authorization: Bearer
         if auth_mode not in ("api_key", "bearer"):
             raise ValueError(f"auth_mode must be 'api_key' or 'bearer', got '{auth_mode}'")
@@ -138,6 +143,18 @@ class TornadoClient:
             )
         return self._sync_client
 
+    def _retry_delay(self, retry_after: Optional[int], attempt: int) -> float:
+        """Compute a single retry sleep, clamped to ``[0, max_backoff]``.
+
+        Uses the server-provided ``Retry-After`` when available, otherwise
+        exponential backoff (``2 ** attempt``). The clamp guarantees that a
+        hostile or malformed ``Retry-After`` can never block the caller
+        unboundedly, and that the delay is never negative (which would crash
+        ``time.sleep`` in the sync path).
+        """
+        base = float(retry_after) if retry_after is not None else float(2 ** attempt)
+        return max(0.0, min(base, self.max_backoff))
+
     async def _request(
         self,
         method: str,
@@ -164,16 +181,19 @@ class TornadoClient:
                 )
                 return self._handle_response(response)
             except (RateLimitError, TornadoAPIError) as e:
-                # Retry on rate limit (429) with Retry-After or backoff
+                # Retry on rate limit (429) — but ONLY while retries remain, and
+                # with the sleep clamped. This makes max_retries=0 fail fast and
+                # prevents a server-controlled Retry-After from blocking forever.
                 if isinstance(e, RateLimitError):
-                    wait = e.retry_after or (2 ** attempt)
-                    await asyncio.sleep(wait)
-                    last_exc = e
-                    continue
-                # Retry on server errors (5xx) with backoff
+                    if attempt < self.max_retries:
+                        await asyncio.sleep(self._retry_delay(e.retry_after, attempt))
+                        last_exc = e
+                        continue
+                    raise
+                # Retry on server errors (5xx) with clamped backoff
                 if isinstance(e, TornadoAPIError) and e.status_code >= 500:
                     if attempt < self.max_retries:
-                        await asyncio.sleep(2 ** attempt)
+                        await asyncio.sleep(self._retry_delay(None, attempt))
                         last_exc = e
                         continue
                 # Non-retryable API errors (400, 401, 403, 404) — raise immediately
@@ -181,7 +201,7 @@ class TornadoClient:
             except httpx.HTTPError as e:
                 # Network-level errors (timeout, connection refused, etc.)
                 if attempt < self.max_retries:
-                    await asyncio.sleep(2 ** attempt)
+                    await asyncio.sleep(self._retry_delay(None, attempt))
                     last_exc = e
                     continue
                 raise TornadoAPIError(
@@ -211,19 +231,20 @@ class TornadoClient:
                 return self._handle_response(response)
             except (RateLimitError, TornadoAPIError) as e:
                 if isinstance(e, RateLimitError):
-                    wait = e.retry_after or (2 ** attempt)
-                    time.sleep(wait)
-                    last_exc = e
-                    continue
+                    if attempt < self.max_retries:
+                        time.sleep(self._retry_delay(e.retry_after, attempt))
+                        last_exc = e
+                        continue
+                    raise
                 if isinstance(e, TornadoAPIError) and e.status_code >= 500:
                     if attempt < self.max_retries:
-                        time.sleep(2 ** attempt)
+                        time.sleep(self._retry_delay(None, attempt))
                         last_exc = e
                         continue
                 raise
             except httpx.HTTPError as e:
                 if attempt < self.max_retries:
-                    time.sleep(2 ** attempt)
+                    time.sleep(self._retry_delay(None, attempt))
                     last_exc = e
                     continue
                 raise TornadoAPIError(
@@ -284,8 +305,11 @@ class TornadoClient:
             retry_after = None
             if "Retry-After" in response.headers:
                 try:
-                    retry_after = int(response.headers["Retry-After"])
+                    # Clamp to >= 0: a negative Retry-After would otherwise crash
+                    # time.sleep() in the sync retry path with a raw ValueError.
+                    retry_after = max(0, int(response.headers["Retry-After"]))
                 except ValueError:
+                    # Non-integer (e.g. RFC 7231 HTTP-date) — fall back to backoff.
                     pass
             raise RateLimitError(error_msg, 429, body, retry_after)
         elif response.status_code == 400:

@@ -20,24 +20,74 @@ from typing import Any, Optional
 
 
 # =============================================================================
+# Secret redaction (keep credentials out of __repr__ / logs / tracebacks)
+# =============================================================================
+
+#: Field/key names that hold credentials and must never appear in repr()/logs.
+SECRET_FIELD_NAMES = frozenset(
+    {
+        "secret_key",
+        "access_key",
+        "access_key_id",
+        "access_key_secret",
+        "account_key",
+        "sas_token",
+        "service_account_json",
+        "api_key",
+    }
+)
+
+_REDACTED = "***REDACTED***"
+
+
+def _redact(data: dict[str, Any]) -> dict[str, Any]:
+    """Return a shallow copy of ``data`` with known secret values masked."""
+    return {
+        k: (_REDACTED if k in SECRET_FIELD_NAMES and v is not None else v)
+        for k, v in data.items()
+    }
+
+
+# =============================================================================
 # Enumerations
 # =============================================================================
 
 
 class JobStatus(str, Enum):
-    """Possible states of a download job in the pipeline.
+    """Possible *status* values of a download job, as returned by the API.
 
-    Lifecycle: Pending -> Downloading -> Muxing -> Uploading -> Completed
-    A job can transition to Failed or Cancelled from any active state.
+    These are the values of the ``status`` field. The fine-grained pipeline
+    stage (downloading, muxing, uploading, ...) is reported separately in the
+    ``step`` field — see :class:`JobStep`.
+
+    Lifecycle: ``Pending`` -> ``Processing`` -> a terminal state. Terminal
+    states are ``Completed``, ``Failed``, ``Warning`` and ``Skipped`` (plus
+    ``Cancelled`` when a job is cancelled via ``DELETE /jobs/:id``).
     """
 
-    PENDING = "Pending"           # Queued, waiting for a worker to pick it up
-    DOWNLOADING = "Downloading"   # Worker is downloading video/audio streams
-    MUXING = "Muxing"             # FFmpeg is muxing audio+video into final container
-    UPLOADING = "Uploading"       # Uploading the final file to cloud storage
-    COMPLETED = "Completed"       # Done - s3_url is available
-    FAILED = "Failed"             # Failed - check error and error_type fields
-    CANCELLED = "Cancelled"       # Cancelled by user via DELETE /jobs/:id
+    PENDING = "Pending"         # Queued, waiting for a worker to pick it up
+    PROCESSING = "Processing"   # Actively being processed (see `step` for the stage)
+    COMPLETED = "Completed"     # Terminal: done - s3_url is available
+    FAILED = "Failed"           # Terminal: failed - check error / error_type
+    WARNING = "Warning"         # Terminal: content issue (private/geo-blocked/bot-detected)
+    SKIPPED = "Skipped"         # Terminal: skipped (e.g. unprocessable content)
+    CANCELLED = "Cancelled"     # Terminal: cancelled by user via DELETE /jobs/:id
+    UNKNOWN = "Unknown"         # Sentinel for a status this SDK version doesn't recognize
+
+
+class JobStep(str, Enum):
+    """Fine-grained pipeline stage reported in a job's ``step`` field.
+
+    Unlike :class:`JobStatus`, ``step`` is informational only (a UI hint). It is
+    exposed on :class:`Job` as a raw string; this enum simply documents the
+    known values without constraining what the API may send.
+    """
+
+    QUEUED = "Queued"
+    DOWNLOADING = "Downloading"
+    MUXING = "Muxing"
+    UPLOADING = "Uploading"
+    FINISHED = "Finished"
 
 
 # =============================================================================
@@ -338,9 +388,10 @@ class Job:
     # -- PUBLIC: Core fields (always present) ---------------------------------
     id: str                                  # Unique job UUID
     url: str                                 # Original video URL
-    status: JobStatus                        # Current pipeline stage
+    status: JobStatus                        # Job status (see JobStatus enum)
 
     # -- PUBLIC: Output fields (populated on completion) ----------------------
+    raw_status: Optional[str] = None         # Original status string from the API (set when status is UNKNOWN)
     s3_url: Optional[str] = None             # Presigned download URL for the output file
     # Real object key + bucket + provider, when the API returns them.
     # The path encoded in the presigned ``s3_url`` may include extra prefixes
@@ -418,19 +469,25 @@ class Job:
     def from_dict(cls, data: dict[str, Any]) -> Job:
         """Deserialize a job from the API JSON response.
 
-        Handles unknown status values gracefully by defaulting to PENDING.
+        Unknown status values (from a newer API version) map to
+        ``JobStatus.UNKNOWN`` and the original string is preserved on
+        ``raw_status``.
         """
-        status_str = data.get("status", "Pending")
+        raw_status = data.get("status", "Pending")
         try:
-            status = JobStatus(status_str)
+            status = JobStatus(raw_status)
         except ValueError:
-            # Unknown status value from a newer API version - default to Pending
-            status = JobStatus.PENDING
+            # Unknown status from a newer API version. Do NOT coerce to PENDING:
+            # that previously made terminal statuses (Warning/Skipped) look
+            # non-terminal and hang wait_for_job forever. Use an explicit
+            # sentinel and keep the raw value available on `raw_status`.
+            status = JobStatus.UNKNOWN
 
         return cls(
             id=data["id"],
             url=data.get("url", ""),
             status=status,
+            raw_status=raw_status,
             s3_url=data.get("s3_url"),
             s3_key=data.get("s3_key") or data.get("object_key") or data.get("key"),
             s3_bucket=data.get("s3_bucket") or data.get("bucket"),
@@ -502,14 +559,40 @@ class Job:
         return self.status == JobStatus.FAILED
 
     @property
+    def is_warning(self) -> bool:
+        """True if the job ended with a content warning (terminal).
+
+        Common causes: private/geo-blocked video, bot detection, or other
+        content issues. The job will not progress further.
+        """
+        return self.status == JobStatus.WARNING
+
+    @property
+    def is_skipped(self) -> bool:
+        """True if the job was skipped (terminal)."""
+        return self.status == JobStatus.SKIPPED
+
+    @property
     def is_cancelled(self) -> bool:
         """True if the job was cancelled by the user."""
         return self.status == JobStatus.CANCELLED
 
     @property
     def is_terminal(self) -> bool:
-        """True if the job is in a final state and will not change anymore."""
-        return self.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED)
+        """True if the job is in a final state and will not change anymore.
+
+        Terminal statuses are Completed, Failed, Warning, Skipped and Cancelled.
+        An UNKNOWN status (unrecognized by this SDK version) is treated as
+        non-terminal so wait loops keep polling rather than declaring a wrong
+        outcome — pass a ``timeout`` to bound them.
+        """
+        return self.status in (
+            JobStatus.COMPLETED,
+            JobStatus.FAILED,
+            JobStatus.WARNING,
+            JobStatus.SKIPPED,
+            JobStatus.CANCELLED,
+        )
 
 
 @dataclass
@@ -672,8 +755,8 @@ class S3StorageConfig:
     endpoint: str
     bucket: str
     region: str
-    access_key: str
-    secret_key: str
+    access_key: str = field(repr=False)   # secret — kept out of repr()
+    secret_key: str = field(repr=False)   # secret — kept out of repr()
     folder_prefix: Optional[str] = None
     base_folder: Optional[str] = None
 
@@ -711,8 +794,8 @@ class BlobStorageConfig:
 
     account_name: str
     container: str
-    account_key: Optional[str] = None
-    sas_token: Optional[str] = None
+    account_key: Optional[str] = field(default=None, repr=False)  # secret
+    sas_token: Optional[str] = field(default=None, repr=False)    # secret
     folder_prefix: Optional[str] = None
     base_folder: Optional[str] = None
 
@@ -749,7 +832,7 @@ class GcsStorageConfig:
 
     project_id: str
     bucket: str
-    service_account_json: str
+    service_account_json: str = field(repr=False)  # secret — full private key JSON
     folder_prefix: Optional[str] = None
     base_folder: Optional[str] = None
 
@@ -784,8 +867,8 @@ class OssStorageConfig:
 
     endpoint: str
     bucket: str
-    access_key_id: str
-    access_key_secret: str
+    access_key_id: str = field(repr=False)      # secret
+    access_key_secret: str = field(repr=False)  # secret
     folder_prefix: Optional[str] = None
     base_folder: Optional[str] = None
 
@@ -835,7 +918,7 @@ class SlackWebhookConfig:
 # =============================================================================
 
 
-@dataclass
+@dataclass(repr=False)
 class InlineStorageConfig:
     """Inline storage credentials passed directly in a job creation request.
 
@@ -858,6 +941,10 @@ class InlineStorageConfig:
     """
 
     _data: dict[str, Any] = field(default_factory=dict)  # Flat payload with "provider" tag
+
+    def __repr__(self) -> str:
+        """Redacted repr — never expose inline credentials in logs/tracebacks."""
+        return f"InlineStorageConfig({_redact(self._data)!r})"
 
     @classmethod
     def s3(

@@ -296,8 +296,20 @@ async def test_validation_error(client):
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_rate_limit_error(client):
-    """429 response should raise RateLimitError with retry_after from headers."""
+async def test_rate_limit_error(client, monkeypatch):
+    """429 with max_retries=0 must raise RateLimitError immediately, WITHOUT sleeping.
+
+    Regression: the 429 branch previously slept the full Retry-After (30s) even
+    when no retries remained, blocking the caller and the test suite.
+    """
+    slept: list[float] = []
+
+    async def _record_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    import asyncio as _asyncio
+    monkeypatch.setattr(_asyncio, "sleep", _record_sleep)
+
     respx.post(f"{BASE_URL}/jobs").mock(
         return_value=httpx.Response(
             429,
@@ -308,7 +320,128 @@ async def test_rate_limit_error(client):
     with pytest.raises(RateLimitError) as exc_info:
         await client.create_job("https://youtube.com/watch?v=abc")
     assert exc_info.value.retry_after == 30
+    # max_retries=0 -> fail fast, no sleep at all.
+    assert slept == []
     await client.close()
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_retry_on_429_then_success(monkeypatch):
+    """A 429 should be retried (within max_retries), honoring Retry-After, then succeed."""
+    slept: list[float] = []
+
+    async def _record_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    import asyncio as _asyncio
+    monkeypatch.setattr(_asyncio, "sleep", _record_sleep)
+
+    c = TornadoClient(api_key="k", max_retries=2)
+    respx.post(f"{BASE_URL}/jobs").mock(
+        side_effect=[
+            httpx.Response(429, json={"error": "slow down"}, headers={"Retry-After": "1"}),
+            httpx.Response(201, json={"job_id": "ok"}),
+        ]
+    )
+    job_id = await c.create_job("https://youtube.com/watch?v=abc")
+    assert job_id == "ok"
+    assert slept == [1.0]  # honored Retry-After once
+    await c.close()
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_retry_on_500_then_success(monkeypatch):
+    """A 5xx should be retried with clamped exponential backoff, then succeed."""
+    slept: list[float] = []
+
+    async def _record_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    import asyncio as _asyncio
+    monkeypatch.setattr(_asyncio, "sleep", _record_sleep)
+
+    c = TornadoClient(api_key="k", max_retries=3)
+    respx.get(f"{BASE_URL}/jobs/abc").mock(
+        side_effect=[
+            httpx.Response(500, json={"error": "boom"}),
+            httpx.Response(200, json={"id": "abc", "url": "u", "status": "Completed"}),
+        ]
+    )
+    job = await c.get_job("abc")
+    assert job.is_completed
+    assert slept == [1.0]  # 2 ** 0
+    await c.close()
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_retry_after_is_clamped_to_max_backoff(monkeypatch):
+    """A huge server Retry-After must be clamped to max_backoff (no unbounded block)."""
+    slept: list[float] = []
+
+    async def _record_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    import asyncio as _asyncio
+    monkeypatch.setattr(_asyncio, "sleep", _record_sleep)
+
+    c = TornadoClient(api_key="k", max_retries=1, max_backoff=5.0)
+    respx.post(f"{BASE_URL}/jobs").mock(
+        side_effect=[
+            httpx.Response(429, json={"error": "x"}, headers={"Retry-After": "86400"}),
+            httpx.Response(201, json={"job_id": "ok"}),
+        ]
+    )
+    job_id = await c.create_job("https://youtube.com/watch?v=abc")
+    assert job_id == "ok"
+    assert slept == [5.0]  # clamped from 86400
+    await c.close()
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_wait_for_job_returns_on_warning_status(client, monkeypatch):
+    """A Warning job is terminal — wait_for_job must return it, not hang/timeout.
+
+    Critical regression: Warning/Skipped used to deserialize to PENDING, so
+    is_terminal stayed False and wait_for_job never returned.
+    """
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    import asyncio as _asyncio
+    monkeypatch.setattr(_asyncio, "sleep", _no_sleep)
+
+    respx.get(f"{BASE_URL}/jobs/warn").mock(
+        return_value=httpx.Response(
+            200, json={"id": "warn", "url": "u", "status": "Warning", "error": "private video"}
+        )
+    )
+    job = await client.wait_for_job("warn", poll_interval=0.0, timeout=5.0)
+    assert job.is_terminal
+    assert job.is_warning
+    await client.close()
+
+
+@respx.mock
+def test_negative_retry_after_does_not_crash_sync():
+    """A negative Retry-After must not crash time.sleep in the sync retry path (#8).
+
+    Before the clamp, int('-5') -> time.sleep(-5) raised a raw ValueError that
+    escaped the RateLimitError/TornadoAPIError contract.
+    """
+    c = TornadoClient(api_key="k", max_retries=1)
+    with c:
+        respx.post(f"{BASE_URL}/jobs").mock(
+            side_effect=[
+                httpx.Response(429, json={"error": "x"}, headers={"Retry-After": "-5"}),
+                httpx.Response(201, json={"job_id": "ok"}),
+            ]
+        )
+        job_id = c.sync_create_job("https://youtube.com/watch?v=abc")
+        assert job_id == "ok"
 
 
 # =============================================================================
