@@ -24,6 +24,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import random
 import time
 from typing import Any, Optional, Union, cast
 
@@ -146,14 +147,20 @@ class TornadoClient:
     def _retry_delay(self, retry_after: Optional[int], attempt: int) -> float:
         """Compute a single retry sleep, clamped to ``[0, max_backoff]``.
 
-        Uses the server-provided ``Retry-After`` when available, otherwise
-        exponential backoff (``2 ** attempt``). The clamp guarantees that a
-        hostile or malformed ``Retry-After`` can never block the caller
-        unboundedly, and that the delay is never negative (which would crash
-        ``time.sleep`` in the sync path).
+        - When the server provided a ``Retry-After``, honor it exactly (clamped
+          and non-negative) — we never retry earlier than the server asked.
+        - Otherwise use exponential backoff (``2 ** attempt``) with *full
+          jitter* (a random value in ``[0, ceiling]``) so many clients don't
+          retry in lockstep and amplify an upstream incident.
+
+        The clamp guarantees a hostile or malformed ``Retry-After`` can never
+        block the caller unboundedly, and that the delay is never negative
+        (which would crash ``time.sleep`` in the sync path).
         """
-        base = float(retry_after) if retry_after is not None else float(2 ** attempt)
-        return max(0.0, min(base, self.max_backoff))
+        if retry_after is not None:
+            return max(0.0, min(float(retry_after), self.max_backoff))
+        ceiling = min(float(2 ** attempt), self.max_backoff)
+        return random.uniform(0.0, ceiling)
 
     async def _request(
         self,
@@ -635,7 +642,8 @@ class TornadoClient:
             Dict with ``batch_id``, ``total_jobs``, and ``job_ids`` list.
 
         Raises:
-            ValidationError: If more than 100 jobs or invalid URLs are provided.
+            ValidationError: If more than 100 jobs are provided.
+            ValueError: If a job item is not a str, BulkJobItem, or dict.
         """
         # Normalize heterogeneous input into BulkJobItem list
         items: list[BulkJobItem] = []
@@ -648,6 +656,11 @@ class TornadoClient:
                 items.append(BulkJobItem(url=j["url"], filename=j.get("filename")))
             else:
                 raise ValueError(f"Invalid job item type: {type(j)}")
+
+        if len(items) > 100:
+            raise ValidationError(
+                f"Bulk request supports at most 100 jobs, got {len(items)}.", 400
+            )
 
         req = CreateBulkRequest(
             jobs=items,
@@ -815,8 +828,10 @@ class TornadoClient:
                     await asyncio.sleep(poll_interval)
                     continue
                 raise
-            # Check if batch is done (all episodes processed)
-            if batch.is_completed or batch.status in ("completed", "failed"):
+            # Terminal batch status (completed = all succeeded, finished = done
+            # with some failures). The episode-count check below is a fallback
+            # for a batch still reporting "processing" once all episodes finish.
+            if batch.is_terminal:
                 return batch
             done = batch.completed_episodes + batch.failed_episodes
             if done >= batch.total_episodes and batch.total_episodes > 0:
@@ -1063,6 +1078,10 @@ class TornadoClient:
                 items.append(BulkJobItem(url=j["url"], filename=j.get("filename")))
             else:
                 raise ValueError(f"Invalid job item type: {type(j)}")
+        if len(items) > 100:
+            raise ValidationError(
+                f"Bulk request supports at most 100 jobs, got {len(items)}.", 400
+            )
         req = CreateBulkRequest(jobs=items, **kwargs)
         return self._request_sync("POST", "/jobs/bulk", json=req.to_dict())
 
@@ -1134,7 +1153,7 @@ class TornadoClient:
                     time.sleep(poll_interval)
                     continue
                 raise
-            if batch.is_completed or batch.status in ("completed", "failed"):
+            if batch.is_terminal:
                 return batch
             done = batch.completed_episodes + batch.failed_episodes
             if done >= batch.total_episodes and batch.total_episodes > 0:

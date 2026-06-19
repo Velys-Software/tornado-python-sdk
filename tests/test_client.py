@@ -265,6 +265,49 @@ async def test_bulk_jobs(client):
     await client.close()
 
 
+@pytest.mark.asyncio
+async def test_bulk_jobs_over_100_raises_validation_error(client):
+    """create_bulk_jobs must enforce the documented 100-job cap client-side."""
+    urls = [f"https://youtube.com/watch?v={i}" for i in range(101)]
+    with pytest.raises(ValidationError):
+        await client.create_bulk_jobs(urls)
+    await client.close()
+
+
+def test_sync_bulk_jobs_over_100_raises_validation_error():
+    """sync_create_bulk_jobs must enforce the same 100-job cap."""
+    with TornadoClient(api_key="k", max_retries=0) as c:
+        urls = [f"https://youtube.com/watch?v={i}" for i in range(101)]
+        with pytest.raises(ValidationError):
+            c.sync_create_bulk_jobs(urls)
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_wait_for_batch_returns_on_finished_status(client, monkeypatch):
+    """A 'finished' batch (done, some episodes failed) is terminal — must return, not hang."""
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    import asyncio as _asyncio
+    monkeypatch.setattr(_asyncio, "sleep", _no_sleep)
+
+    respx.get(f"{BASE_URL}/batch/b1").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "b1", "show_url": "s", "status": "finished",
+                "total_episodes": 3, "completed_episodes": 2, "failed_episodes": 1,
+            },
+        )
+    )
+    batch = await client.wait_for_batch("b1", poll_interval=0.0, timeout=5.0)
+    assert batch.is_terminal
+    assert batch.is_finished
+    assert not batch.is_completed
+    await client.close()
+
+
 # =============================================================================
 # Error handling tests
 # =============================================================================
@@ -384,7 +427,37 @@ async def test_retry_on_500_then_success(monkeypatch):
     )
     job = await c.get_job("abc")
     assert job.is_completed
-    assert slept == [1.0]  # 2 ** 0
+    # Exponential backoff now uses full jitter: one sleep in [0, 2**0].
+    assert len(slept) == 1
+    assert 0.0 <= slept[0] <= 1.0
+    await c.close()
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_exponential_backoff_is_jittered(monkeypatch):
+    """The no-Retry-After backoff path must stay within [0, 2**attempt] (jittered)."""
+    slept: list[float] = []
+
+    async def _record_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    import asyncio as _asyncio
+    monkeypatch.setattr(_asyncio, "sleep", _record_sleep)
+
+    c = TornadoClient(api_key="k", max_retries=3)
+    respx.get(f"{BASE_URL}/jobs/abc").mock(
+        side_effect=[
+            httpx.Response(500, json={"error": "boom"}),
+            httpx.Response(500, json={"error": "boom"}),
+            httpx.Response(200, json={"id": "abc", "url": "u", "status": "Completed"}),
+        ]
+    )
+    job = await c.get_job("abc")
+    assert job.is_completed
+    assert len(slept) == 2
+    assert 0.0 <= slept[0] <= 1.0   # attempt 0 -> [0, 1]
+    assert 0.0 <= slept[1] <= 2.0   # attempt 1 -> [0, 2]
     await c.close()
 
 

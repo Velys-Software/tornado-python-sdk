@@ -605,7 +605,7 @@ class BatchJob:
 
     id: str                                        # Batch UUID
     show_url: str                                  # Original Spotify show URL
-    status: str                                    # Batch status: "paused", "processing", "completed"
+    status: str                                    # "paused", "processing", "completed", "finished"
     folder: Optional[str] = None                   # S3 folder prefix for all episodes
     total_episodes: int = 0                        # Total number of episodes in the batch
     completed_episodes: int = 0                    # Episodes that finished successfully
@@ -628,8 +628,21 @@ class BatchJob:
 
     @property
     def is_completed(self) -> bool:
-        """True if the batch status is 'completed'."""
+        """True if every episode succeeded (batch status 'completed')."""
         return self.status == "completed"
+
+    @property
+    def is_finished(self) -> bool:
+        """True if the batch is done but some episodes failed (status 'finished').
+
+        Like 'completed', this is a terminal state — no episodes are still running.
+        """
+        return self.status == "finished"
+
+    @property
+    def is_terminal(self) -> bool:
+        """True if the batch is no longer running ('completed' or 'finished')."""
+        return self.status in ("completed", "finished")
 
     @property
     def progress_percent(self) -> float:

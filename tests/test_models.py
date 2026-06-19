@@ -178,6 +178,18 @@ def test_batch_job():
     # 55 out of 100 episodes are done (50 completed + 5 failed)
     assert abs(batch.progress_percent - 55.0) < 0.01
     assert not batch.is_completed
+    assert not batch.is_terminal  # status "processing" is still running
+
+
+def test_batch_finished_is_terminal_not_completed():
+    """'finished' = done with some failures: terminal, but not 'completed'."""
+    batch = BatchJob.from_dict({
+        "id": "b", "show_url": "s", "status": "finished",
+        "total_episodes": 3, "completed_episodes": 2, "failed_episodes": 1,
+    })
+    assert batch.is_finished
+    assert batch.is_terminal
+    assert not batch.is_completed
 
 
 # =============================================================================
