@@ -6,21 +6,20 @@ handling, and property accessors for all model classes.
 """
 
 from tornado_sdk.models import (
-    CreateJobRequest,
-    CreateBulkRequest,
+    BatchJob,
+    BlobStorageConfig,
     BulkJobItem,
+    CreateBulkRequest,
+    CreateJobRequest,
+    GcsStorageConfig,
+    InlineStorageConfig,
     Job,
     JobStatus,
-    BatchJob,
     MetadataResponse,
-    UsageResponse,
-    S3StorageConfig,
-    BlobStorageConfig,
-    GcsStorageConfig,
     OssStorageConfig,
-    InlineStorageConfig,
+    S3StorageConfig,
+    UsageResponse,
 )
-
 
 # =============================================================================
 # CreateJobRequest tests

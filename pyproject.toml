@@ -29,15 +29,40 @@ dependencies = [
     "httpx>=0.25.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/Velys-Software/tornado-python-sdk"
+Repository = "https://github.com/Velys-Software/tornado-python-sdk"
+Issues = "https://github.com/Velys-Software/tornado-python-sdk/issues"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21",
     "respx>=0.21",
+    "mypy>=1.8",
+    "ruff>=0.5",
 ]
 
 [tool.setuptools.packages.find]
 include = ["tornado_sdk*"]
 
+[tool.setuptools.package-data]
+# Ship the PEP 561 marker explicitly (don't rely on implicit auto-inclusion).
+"tornado_sdk" = ["py.typed"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]
+# Inline aligned comments in models.py intentionally exceed the line length.
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_redundant_casts = true
+warn_unused_ignores = true

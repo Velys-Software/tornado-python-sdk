@@ -12,7 +12,7 @@ addressable via ``get_job()`` — so don't use it for YouTube.
 
 import asyncio
 
-from tornado_sdk import TornadoClient, BulkJobItem
+from tornado_sdk import BulkJobItem, TornadoClient
 
 
 async def main():
@@ -40,7 +40,8 @@ async def main():
     )
 
     # Wait for each successfully-created job and report results.
-    for source, job_id in zip(urls, job_ids):
+    # bulk_youtube_jobs returns one result per input, in order, so lengths match.
+    for source, job_id in zip(urls, job_ids, strict=True):
         label = source.url if isinstance(source, BulkJobItem) else source
         if isinstance(job_id, Exception):
             print(f"  {label}: SUBMIT FAILED: {job_id}")

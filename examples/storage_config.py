@@ -9,13 +9,13 @@ credentials per-job.
 import asyncio
 
 from tornado_sdk import (
-    TornadoClient,
-    S3StorageConfig,
     BlobStorageConfig,
     GcsStorageConfig,
-    OssStorageConfig,
     InlineStorageConfig,
+    OssStorageConfig,
+    S3StorageConfig,
     SlackWebhookConfig,
+    TornadoClient,
 )
 
 

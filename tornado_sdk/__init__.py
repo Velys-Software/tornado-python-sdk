@@ -21,35 +21,35 @@ For async usage:
 # -- Main client class --------------------------------------------------------
 from tornado_sdk.client import TornadoClient
 
+# -- Exception hierarchy ------------------------------------------------------
+from tornado_sdk.exceptions import (
+    AuthenticationError,  # 401/403 - invalid or missing API key
+    NotFoundError,  # 404 - job/batch/resource not found
+    RateLimitError,  # 429 - rate limit exceeded (has retry_after)
+    TornadoAPIError,  # HTTP error returned by the API (has status_code)
+    TornadoError,  # Base exception for all SDK errors
+    ValidationError,  # 400 - invalid request parameters
+)
+
 # -- Data models (request/response types) ------------------------------------
 from tornado_sdk.models import (
+    BatchJob,
+    BlobStorageConfig,
+    BulkJobItem,
+    CreateBulkRequest,
+    CreateJobRequest,
+    GcsStorageConfig,
+    # Inline storage credentials passed per-job (marketplace users)
+    InlineStorageConfig,
     Job,
     JobStatus,
     JobStep,
-    CreateJobRequest,
-    CreateBulkRequest,
-    BulkJobItem,
-    BatchJob,
     MetadataResponse,
-    UsageResponse,
+    OssStorageConfig,
     # Storage configuration models for each cloud provider
     S3StorageConfig,
-    BlobStorageConfig,
-    GcsStorageConfig,
-    OssStorageConfig,
     SlackWebhookConfig,
-    # Inline storage credentials passed per-job (marketplace users)
-    InlineStorageConfig,
-)
-
-# -- Exception hierarchy ------------------------------------------------------
-from tornado_sdk.exceptions import (
-    TornadoError,        # Base exception for all SDK errors
-    TornadoAPIError,     # HTTP error returned by the API (has status_code)
-    AuthenticationError, # 401/403 - invalid or missing API key
-    RateLimitError,      # 429 - rate limit exceeded (has retry_after)
-    NotFoundError,       # 404 - job/batch/resource not found
-    ValidationError,     # 400 - invalid request parameters
+    UsageResponse,
 )
 
 __version__ = "1.0.0"

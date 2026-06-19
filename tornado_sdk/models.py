@@ -18,7 +18,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
 
-
 # =============================================================================
 # Secret redaction (keep credentials out of __repr__ / logs / tracebacks)
 # =============================================================================
