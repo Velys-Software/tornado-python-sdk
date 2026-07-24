@@ -24,8 +24,11 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import random
 import time
+import uuid
 from typing import Any, Optional, Union, cast
 
 import httpx
@@ -44,7 +47,9 @@ from tornado_sdk.models import (
     CreateBulkRequest,
     CreateJobRequest,
     GcsStorageConfig,
+    GDriveStorageConfig,
     InlineStorageConfig,
+    IsShortResponse,
     Job,
     MetadataResponse,
     OssStorageConfig,
@@ -117,6 +122,19 @@ class TornadoClient:
             headers["x-api-key"] = self.api_key
         return headers
 
+    @staticmethod
+    def _idempotency_headers(key: Optional[str]) -> dict[str, str]:
+        """Build the ``x-idempotency-key`` header for POST /jobs.
+
+        The API deduplicates job creation on this header: if a previous
+        request with the same key already created a job, it returns the
+        existing ``job_id`` (with ``"cached": true``) instead of creating a
+        duplicate. One key is generated per logical create call, so the
+        client's internal retries (5xx / network errors) can never create
+        duplicate jobs even when the original response was lost.
+        """
+        return {"x-idempotency-key": key or str(uuid.uuid4())}
+
     # =========================================================================
     # HTTP Transport Layer
     # =========================================================================
@@ -168,6 +186,7 @@ class TornadoClient:
         path: str,
         json: Optional[dict[str, Any]] = None,
         params: Optional[dict[str, Any]] = None,
+        headers: Optional[dict[str, str]] = None,
     ) -> dict[str, Any]:
         """Execute an async HTTP request with automatic retry on transient errors.
 
@@ -176,7 +195,11 @@ class TornadoClient:
             - 5xx (Server Error): Exponential backoff (2^attempt seconds)
             - Network errors (httpx.HTTPError): Exponential backoff
 
-        Non-retryable errors (400, 401, 403, 404) are raised immediately.
+        Non-retryable errors (400, 401, 403, 404, 422) are raised immediately.
+
+        ``headers`` are per-request extras merged over the client defaults
+        (e.g. ``x-idempotency-key``); they are identical across retries so a
+        retried POST is deduplicated server-side.
         """
         client = await self._get_async_client()
         last_exc: Optional[Exception] = None
@@ -184,7 +207,7 @@ class TornadoClient:
         for attempt in range(self.max_retries + 1):
             try:
                 response = await client.request(
-                    method, path, json=json, params=params
+                    method, path, json=json, params=params, headers=headers
                 )
                 return self._handle_response(response)
             except (RateLimitError, TornadoAPIError) as e:
@@ -224,6 +247,7 @@ class TornadoClient:
         path: str,
         json: Optional[dict[str, Any]] = None,
         params: Optional[dict[str, Any]] = None,
+        headers: Optional[dict[str, str]] = None,
     ) -> dict[str, Any]:
         """Execute a synchronous HTTP request with automatic retry.
 
@@ -234,7 +258,9 @@ class TornadoClient:
 
         for attempt in range(self.max_retries + 1):
             try:
-                response = client.request(method, path, json=json, params=params)
+                response = client.request(
+                    method, path, json=json, params=params, headers=headers
+                )
                 return self._handle_response(response)
             except (RateLimitError, TornadoAPIError) as e:
                 if isinstance(e, RateLimitError):
@@ -294,10 +320,14 @@ class TornadoClient:
             body = _safe_json()
             return body if isinstance(body, dict) else {}
 
-        # Error path — body may be None, a non-dict, or a plain text error
+        # Error path — body may be None, a non-dict, or a plain text error.
+        # Some endpoints (GET /jobs/:id, GET /batch/:id) return a literal JSON
+        # `null` body on 401/404 — treat that like an empty body, not "null".
         body = _safe_json()
         if not isinstance(body, dict):
             text = (response.text or "").strip()
+            if text == "null":
+                text = ""
             body = {"error": text or f"HTTP {response.status_code}"}
 
         error_msg = body.get("error") or f"HTTP {response.status_code}"
@@ -319,8 +349,12 @@ class TornadoClient:
                     # Non-integer (e.g. RFC 7231 HTTP-date) — fall back to backoff.
                     pass
             raise RateLimitError(error_msg, 429, body, retry_after)
-        elif response.status_code == 400:
-            raise ValidationError(error_msg, 400, body)
+        elif response.status_code in (400, 422):
+            # 400: application-level validation errors ({"error": ...}).
+            # 422: axum's JSON deserialization rejections (wrong type, out-of-
+            # range value like video_quality > 255) — same "fix your request"
+            # semantics, so surface both as ValidationError.
+            raise ValidationError(error_msg, response.status_code, body)
         else:
             raise TornadoAPIError(error_msg, response.status_code, body)
 
@@ -395,21 +429,35 @@ class TornadoClient:
         enable_progress_webhook: bool = False,
         storage: Optional[InlineStorageConfig] = None,
         paused: bool = False,
+        idempotency_key: Optional[str] = None,
     ) -> str:
         """Create a new download job.
 
         Submits a video URL to the Tornado API for download, processing,
         and upload to your configured cloud storage.
 
-        For Spotify show URLs (/show/), the API automatically extracts all
-        episodes and returns a batch_id instead of a job_id.
+        Batch URLs: for Spotify show URLs (``/show/``) AND YouTube playlist
+        URLs (``?list=...``), the API extracts all episodes/videos and
+        returns a ``batch_id`` instead of a ``job_id``. Use
+        ``create_job_full()`` if you need the full batch payload (episode
+        lists use different keys: ``episode_jobs`` for Spotify shows,
+        ``video_jobs`` for YouTube playlists).
+
+        Idempotency: an ``x-idempotency-key`` header is sent automatically
+        (a random UUID per call, stable across internal retries), so a
+        retried POST after a lost response cannot create a duplicate job.
+        Pass ``idempotency_key`` explicitly to deduplicate across your own
+        application-level retries.
 
         Args:
             url: Video URL to download.
+            idempotency_key: Optional explicit idempotency key. Auto-generated
+                when omitted.
             **kwargs: See CreateJobRequest for all available parameters.
 
         Returns:
-            Job ID (str) for single videos, or batch ID for Spotify shows.
+            Job ID (str) for single videos, or batch ID for Spotify shows
+            and YouTube playlists.
         """
         req = CreateJobRequest(
             url=url,
@@ -436,9 +484,13 @@ class TornadoClient:
             storage=storage,
             paused=paused,
         )
-        data = await self._request("POST", "/jobs", json=req.to_dict())
+        data = await self._request(
+            "POST", "/jobs", json=req.to_dict(),
+            headers=self._idempotency_headers(idempotency_key),
+        )
         # API returns {"job_id": "..."} for single jobs,
-        # or {"batch_id": "...", "total_episodes": N, ...} for Spotify shows
+        # {"batch_id": "...", "total_episodes": N, ...} for Spotify shows,
+        # or {"batch_id": "...", "total_videos": N, ...} for YouTube playlists
         return data.get("job_id") or data.get("batch_id", "")
 
     async def create_job_full(
@@ -449,14 +501,26 @@ class TornadoClient:
         """Create a download job and return the full raw API response.
 
         Unlike ``create_job()`` which returns just the ID, this returns the
-        complete response dict. Useful for Spotify shows where you need
-        the episode list and batch metadata.
+        complete response dict. Useful for batch URLs where you need the
+        item list and batch metadata. Response shapes:
+
+        - Single video: ``{"job_id": "..."}`` (plus ``"cached": true`` when
+          an idempotency key matched a previous request)
+        - Spotify show: ``{"batch_id", "total_episodes", "paused",
+          "episodes": [{job_id, url, title}, ...], "episode_jobs": [...]}``
+        - YouTube playlist: ``{"batch_id", "total_videos", "video_jobs": [...]}``
+
+        Accepts the same ``idempotency_key`` keyword as ``create_job()``.
 
         Returns:
             Raw API response dict (job_id or batch_id + metadata).
         """
+        idempotency_key = kwargs.pop("idempotency_key", None)
         req = CreateJobRequest(url=url, **kwargs)
-        return await self._request("POST", "/jobs", json=req.to_dict())
+        return await self._request(
+            "POST", "/jobs", json=req.to_dict(),
+            headers=self._idempotency_headers(idempotency_key),
+        )
 
     async def get_job(self, job_id: str) -> Job:
         """Get the current status and details of a download job.
@@ -465,10 +529,17 @@ class TornadoClient:
             job_id: The UUID returned by create_job().
 
         Returns:
-            Job object with status, output URL, metrics, etc.
+            Job object with status, output URL, metrics, etc. Fresh jobs
+            (served from the API's cache) only carry the core fields; full
+            telemetry and the parameter echo appear once the job is
+            persisted (typically within seconds of completion).
 
         Raises:
-            NotFoundError: If the job ID doesn't exist or has expired (24h TTL).
+            NotFoundError: If the job ID is unknown or belongs to another
+                API key. (Jobs persist beyond the 24h cache window — only
+                the *active-job* cache expires, completed jobs remain
+                queryable from the database.)
+            ValidationError: If job_id is not a valid UUID.
         """
         data = await self._request("GET", f"/jobs/{job_id}")
         return Job.from_dict(data)
@@ -482,15 +553,25 @@ class TornadoClient:
     ) -> tuple[list[Job], int]:
         """List your jobs with optional pagination and status filtering.
 
+        .. note::
+            List items include the raw ``s3_key`` but NOT the presigned
+            ``s3_url``/``subtitle_url``/``thumbnail_url`` — call
+            ``get_job(id)`` to obtain a download URL for a specific job.
+
         Args:
-            limit: Maximum number of jobs to return.
+            limit: Maximum number of jobs to return. Server default: 20,
+                server-side maximum: 100 (higher values are clamped).
             offset: Number of jobs to skip (for pagination).
             status: Filter by status (case-insensitive; normalized to lowercase
                 for the API). Valid values: "pending", "processing",
-                "completed", "failed", "warning".
+                "completed", "failed", "warning". Any other value (including
+                "skipped" and "cancelled") is silently IGNORED by the API,
+                which then returns the unfiltered list.
 
         Returns:
-            Tuple of (list of Job objects, total count).
+            Tuple of (list of Job objects, total count). ``total`` is the
+            total number of jobs for this API key — it does NOT reflect the
+            ``status`` filter.
         """
         params: dict[str, Any] = {}
         if limit is not None:
@@ -507,28 +588,45 @@ class TornadoClient:
         return jobs, data.get("total", len(jobs))
 
     async def cancel_job(self, job_id: str) -> dict[str, Any]:
-        """Cancel a pending or in-progress job.
+        """Cancel a job that is still queued (not yet picked up by a worker).
 
-        Jobs that are already completed or failed cannot be cancelled.
+        Only jobs still waiting in the queue can be cancelled. Jobs already
+        processing, completed or failed cannot — the API returns 400
+        ("not in queue or already processing") in that case.
+
+        .. warning::
+            Do NOT call ``wait_for_job()`` on a job you just cancelled.
+            The API has no "Cancelled" status: the job is persisted as
+            ``Failed`` (with ``step == "Cancelled"``), but its cache entry
+            may keep reporting ``Pending`` for up to ~24h, which would make
+            a wait loop spin until its timeout. Use ``Job.is_cancelled``
+            to recognize a cancelled job when you encounter one later.
 
         Args:
             job_id: The UUID of the job to cancel.
 
         Returns:
-            API response dict with cancellation status.
+            Dict ``{"message": "...", "job_id": "..."}`` on success.
+
+        Raises:
+            ValidationError: If the job is already processing or terminal.
         """
         return await self._request("DELETE", f"/jobs/{job_id}")
 
     async def retry_job(self, job_id: str) -> dict[str, Any]:
-        """Retry a failed job with the same parameters.
+        """Retry a failed or warning job with the same parameters.
 
-        Creates a new job using the original parameters and returns a new job ID.
+        Creates a brand-new job reusing all original parameters. Only jobs
+        with status ``Failed`` or ``Warning`` can be retried (400 otherwise).
 
         Args:
-            job_id: The UUID of the failed job to retry.
+            job_id: The UUID of the failed/warning job to retry.
 
         Returns:
-            API response dict with the new job ID.
+            Dict ``{"job_id": <new id>, "original_job_id": ..., "message": ...}``.
+
+        Raises:
+            ValidationError: If the job is not in Failed/Warning status.
         """
         return await self._request("POST", f"/jobs/{job_id}/retry")
 
@@ -585,7 +683,7 @@ class TornadoClient:
                 raise
             if job.is_terminal:
                 return job
-            if timeout and (time.monotonic() - start) >= timeout:
+            if timeout is not None and (time.monotonic() - start) >= timeout:
                 raise TimeoutError(
                     f"Job {job_id} did not complete within {timeout}s (status: {job.status.value})"
                 )
@@ -622,14 +720,27 @@ class TornadoClient:
         All jobs share the same encoding options but can have individual filenames.
         Accepts a flexible list of URLs, BulkJobItem objects, or dicts.
 
-        .. warning::
-            This endpoint is primarily designed for **Spotify show batches**.
-            For non-Spotify URLs (e.g. plain YouTube), the returned ``batch_id``
-            and ``job_ids`` may not be addressable via ``get_job()`` /
-            ``get_batch()`` / ``start_batch()``. If you only have YouTube URLs,
-            use :meth:`bulk_youtube_jobs` instead, which fans out individual
-            ``create_job()`` calls under a concurrency limit and returns
-            normal job IDs that work with the standard endpoints.
+        The returned ``job_ids`` are regular jobs: each is addressable via
+        ``get_job()`` / ``wait_for_job()`` (allow for a short creation lag —
+        the default ``not_found_grace_period`` covers it).
+
+        Endpoint limitations (per the API):
+
+        - The returned ``batch_id`` is a grouping label only — there is NO
+          batch record behind it, so ``get_batch()`` / ``wait_for_batch()`` /
+          ``start_batch()`` / ``rename_batch_jobs()`` return 404 for it.
+          Those endpoints only work for Spotify-show batches created via
+          ``create_job()``. Track progress per job via the ``job_ids``.
+        - ``webhook_url`` and ``enable_progress_webhook`` are NOT supported
+          in bulk (silently disabled server-side), and ``paused`` mode is
+          unavailable.
+        - Marketplace users (``auth_mode="bearer"``) get 403 — bulk is
+          direct-API only.
+
+        If you need per-job webhooks, inline storage, or paused mode, use
+        :meth:`bulk_youtube_jobs` instead: it fans out individual
+        ``create_job()`` calls under a concurrency limit and supports every
+        ``create_job`` option.
 
         Args:
             jobs: List of video URLs. Each item can be:
@@ -694,12 +805,17 @@ class TornadoClient:
     ) -> list[Union[str, Exception]]:
         """Fan out ``create_job()`` calls for a list of YouTube URLs.
 
-        Workaround for the limitation documented on :meth:`create_bulk_jobs`:
-        the ``/jobs/bulk`` endpoint returns IDs that are not addressable via
-        ``get_job()`` for non-Spotify URLs. This helper instead invokes
-        ``POST /jobs`` once per URL — under an ``asyncio.Semaphore`` to bound
-        concurrency — and returns plain job IDs that work with all standard
-        job endpoints.
+        Alternative to :meth:`create_bulk_jobs` that supports every
+        ``create_job`` option: per-job ``webhook_url``, progress webhooks,
+        inline ``storage`` credentials, ``paused`` mode… none of which the
+        ``/jobs/bulk`` endpoint accepts. It invokes ``POST /jobs`` once per
+        URL — under an ``asyncio.Semaphore`` to bound concurrency — and each
+        call carries its own idempotency key, so retries never duplicate jobs.
+
+        .. note::
+            Careful with playlist URLs here: a URL containing ``?list=``
+            makes the API create a *batch* and the returned ID is a
+            ``batch_id``, not a ``job_id``.
 
         Args:
             urls: List of URLs. Each item can be a string, a ``BulkJobItem``
@@ -829,14 +945,15 @@ class TornadoClient:
                     continue
                 raise
             # Terminal batch status (completed = all succeeded, finished = done
-            # with some failures). The episode-count check below is a fallback
-            # for a batch still reporting "processing" once all episodes finish.
+            # with failures and/or skips). The episode-count check below is a
+            # fallback for a batch still reporting "processing" once all
+            # episodes finish — it must count skipped episodes too, or a batch
+            # with skips would never satisfy it.
             if batch.is_terminal:
                 return batch
-            done = batch.completed_episodes + batch.failed_episodes
-            if done >= batch.total_episodes and batch.total_episodes > 0:
+            if batch.done_episodes >= batch.total_episodes and batch.total_episodes > 0:
                 return batch
-            if timeout and (time.monotonic() - start) >= timeout:
+            if timeout is not None and (time.monotonic() - start) >= timeout:
                 raise TimeoutError(
                     f"Batch {batch_id} did not complete within {timeout}s"
                 )
@@ -861,6 +978,22 @@ class TornadoClient:
         data = await self._request("POST", "/metadata", json={"url": url})
         return MetadataResponse.from_dict(data)
 
+    async def is_short(self, url: str) -> IsShortResponse:
+        """Detect whether a YouTube URL is a Short (vertical video).
+
+        Classification is done by aspect ratio of the best available format
+        (height > width => short). No download is performed.
+
+        Args:
+            url: YouTube video/short URL.
+
+        Returns:
+            IsShortResponse with is_short, video_type ("short"/"video"/"live"),
+            dimensions and duration.
+        """
+        data = await self._request("POST", "/is-short", json={"url": url})
+        return IsShortResponse.from_dict(data)
+
     # =========================================================================
     # Usage — Account Statistics
     # =========================================================================
@@ -877,6 +1010,9 @@ class TornadoClient:
     # =========================================================================
     # Storage Configuration — Multi-Cloud Setup
     # =========================================================================
+    # NOTE: all /user/* endpoints are DIRECT API only. Marketplace users
+    # (auth_mode="bearer" via Apify/RapidAPI/Zyla) cannot call them — use
+    # inline per-job storage (InlineStorageConfig) instead.
 
     async def configure_s3(self, config: S3StorageConfig) -> dict[str, Any]:
         """Configure S3-compatible storage for your account.
@@ -895,6 +1031,20 @@ class TornadoClient:
     async def delete_s3(self) -> dict[str, Any]:
         """Remove your S3 storage configuration. Falls back to server default storage."""
         return await self._request("DELETE", "/user/s3")
+
+    async def get_s3(self) -> dict[str, Any]:
+        """Inspect the S3 storage configuration saved for this API key.
+
+        Secrets are never returned: at most ``access_key_masked`` shows the
+        last 4 characters of the access key (legacy storage mode only).
+
+        Returns:
+            Dict with ``configured`` (bool) and, when configured:
+            ``provider``, ``container_or_bucket``, ``endpoint``, ``region``,
+            ``folder_prefix``, ``base_folder``, ``access_key_masked``,
+            ``last_modified``, ``source`` ("keyvault" or "legacy").
+        """
+        return await self._request("GET", "/user/s3")
 
     async def configure_blob(self, config: BlobStorageConfig) -> dict[str, Any]:
         """Configure Azure Blob Storage for your account.
@@ -925,6 +1075,24 @@ class TornadoClient:
     async def delete_gcs(self) -> dict[str, Any]:
         """Remove your Google Cloud Storage configuration."""
         return await self._request("DELETE", "/user/gcs")
+
+    async def configure_gdrive(self, config: GDriveStorageConfig) -> dict[str, Any]:
+        """Configure Google Drive delivery for your account.
+
+        Files are uploaded to the given Drive folder using a service account.
+        Remember to share the target folder with the service account's email.
+
+        Args:
+            config: Google Drive config with folder_id and service account JSON.
+
+        Returns:
+            Confirmation dict with provider and folder info.
+        """
+        return await self._request("POST", "/user/gdrive", json=config.to_dict())
+
+    async def delete_gdrive(self) -> dict[str, Any]:
+        """Remove your Google Drive delivery configuration."""
+        return await self._request("DELETE", "/user/gdrive")
 
     async def configure_oss(self, config: OssStorageConfig) -> dict[str, Any]:
         """Configure Alibaba Cloud OSS for your account.
@@ -993,15 +1161,106 @@ class TornadoClient:
         return await self._request("DELETE", "/user/slack")
 
     # =========================================================================
+    # Webhook Signing — Secret Management & Signature Verification
+    # =========================================================================
+
+    async def get_webhook_secret(self) -> str:
+        """Get (or lazily create) this API key's webhook signing secret.
+
+        Every outcome webhook (job_completed / job_failed / job_warning /
+        job_skipped / batch_completed) is sent with an ``X-Tornado-Signature``
+        header signed with this secret. Verify incoming webhooks with
+        :meth:`verify_webhook_signature`.
+
+        Returns:
+            The signing secret string (``"whsec_..."``). Generated on first
+            call if the key doesn't have one yet.
+        """
+        data = await self._request("GET", "/user/webhook-secret")
+        return data.get("webhook_signing_secret", "")
+
+    async def rotate_webhook_secret(self) -> str:
+        """Rotate (regenerate) this API key's webhook signing secret.
+
+        The previous secret stops matching future webhook signatures
+        immediately — update your webhook receiver before/right after calling.
+
+        Returns:
+            The NEW signing secret string (``"whsec_..."``).
+        """
+        data = await self._request("POST", "/user/webhook-secret/rotate")
+        return data.get("webhook_signing_secret", "")
+
+    @staticmethod
+    def verify_webhook_signature(
+        payload: Union[str, bytes],
+        signature_header: str,
+        secret: str,
+        tolerance_seconds: int = 300,
+    ) -> bool:
+        """Verify an ``X-Tornado-Signature`` webhook header.
+
+        The API signs every outcome webhook with
+        ``t=<unix_ts>,v1=<hex_hmac_sha256>`` where the HMAC is computed over
+        ``"{timestamp}.{raw_body}"`` using your webhook signing secret (see
+        :meth:`get_webhook_secret`). This helper recomputes the HMAC over the
+        exact raw body you received, compares in constant time, and rejects
+        stale timestamps to guard against replay.
+
+        Args:
+            payload: The EXACT raw request body as received (bytes preferred;
+                do not re-serialize parsed JSON — key order matters).
+            signature_header: Value of the ``X-Tornado-Signature`` header.
+            secret: Your webhook signing secret (``"whsec_..."``).
+            tolerance_seconds: Maximum allowed age (absolute clock skew) of
+                the signature timestamp. Default: 300 (5 minutes).
+                Pass 0 to skip the timestamp check (not recommended).
+
+        Returns:
+            True if the signature is valid and fresh, False otherwise.
+            Never raises on malformed input.
+        """
+        try:
+            parts = dict(
+                item.split("=", 1) for item in signature_header.split(",") if "=" in item
+            )
+            timestamp = parts["t"]
+            expected_sig = parts["v1"]
+        except (KeyError, ValueError):
+            return False
+
+        if tolerance_seconds:
+            try:
+                ts = int(timestamp)
+            except ValueError:
+                return False
+            if abs(time.time() - ts) > tolerance_seconds:
+                return False
+
+        body = payload if isinstance(payload, bytes) else payload.encode("utf-8")
+        signed_payload = timestamp.encode("ascii") + b"." + body
+        computed = hmac.new(
+            secret.encode("utf-8"), signed_payload, hashlib.sha256
+        ).hexdigest()
+        return hmac.compare_digest(computed, expected_sig)
+
+    # =========================================================================
     # Synchronous Wrappers
     # =========================================================================
     # These methods mirror the async API but use synchronous HTTP calls.
     # Ideal for scripts, CLI tools, and environments without an event loop.
 
     def sync_create_job(self, url: str, **kwargs: Any) -> str:
-        """Synchronous version of ``create_job()``. Returns job_id or batch_id."""
+        """Synchronous version of ``create_job()``. Returns job_id or batch_id.
+
+        Accepts the same ``idempotency_key`` keyword (auto-generated when omitted).
+        """
+        idempotency_key = kwargs.pop("idempotency_key", None)
         req = CreateJobRequest(url=url, **kwargs)
-        data = self._request_sync("POST", "/jobs", json=req.to_dict())
+        data = self._request_sync(
+            "POST", "/jobs", json=req.to_dict(),
+            headers=self._idempotency_headers(idempotency_key),
+        )
         return data.get("job_id") or data.get("batch_id", "")
 
     def sync_get_job(self, job_id: str) -> Job:
@@ -1047,6 +1306,11 @@ class TornadoClient:
         """Synchronous version of ``get_metadata()``. Returns MetadataResponse."""
         data = self._request_sync("POST", "/metadata", json={"url": url})
         return MetadataResponse.from_dict(data)
+
+    def sync_is_short(self, url: str) -> IsShortResponse:
+        """Synchronous version of ``is_short()``. Returns IsShortResponse."""
+        data = self._request_sync("POST", "/is-short", json={"url": url})
+        return IsShortResponse.from_dict(data)
 
     def sync_get_usage(self) -> UsageResponse:
         """Synchronous version of ``get_usage()``. Returns UsageResponse."""
@@ -1109,7 +1373,7 @@ class TornadoClient:
                 raise
             if job.is_terminal:
                 return job
-            if timeout and (time.monotonic() - start_t) >= timeout:
+            if timeout is not None and (time.monotonic() - start_t) >= timeout:
                 raise TimeoutError(
                     f"Job {job_id} did not complete within {timeout}s (status: {job.status.value})"
                 )
@@ -1117,8 +1381,12 @@ class TornadoClient:
 
     def sync_create_job_full(self, url: str, **kwargs: Any) -> dict[str, Any]:
         """Synchronous version of ``create_job_full()``. Returns the raw API response."""
+        idempotency_key = kwargs.pop("idempotency_key", None)
         req = CreateJobRequest(url=url, **kwargs)
-        return self._request_sync("POST", "/jobs", json=req.to_dict())
+        return self._request_sync(
+            "POST", "/jobs", json=req.to_dict(),
+            headers=self._idempotency_headers(idempotency_key),
+        )
 
     def sync_start_batch(self, batch_id: str) -> dict[str, Any]:
         """Synchronous version of ``start_batch()``."""
@@ -1155,10 +1423,9 @@ class TornadoClient:
                 raise
             if batch.is_terminal:
                 return batch
-            done = batch.completed_episodes + batch.failed_episodes
-            if done >= batch.total_episodes and batch.total_episodes > 0:
+            if batch.done_episodes >= batch.total_episodes and batch.total_episodes > 0:
                 return batch
-            if timeout and (time.monotonic() - start_t) >= timeout:
+            if timeout is not None and (time.monotonic() - start_t) >= timeout:
                 raise TimeoutError(
                     f"Batch {batch_id} did not complete within {timeout}s"
                 )
@@ -1173,6 +1440,10 @@ class TornadoClient:
     def sync_delete_s3(self) -> dict[str, Any]:
         """Synchronous version of ``delete_s3()``."""
         return self._request_sync("DELETE", "/user/s3")
+
+    def sync_get_s3(self) -> dict[str, Any]:
+        """Synchronous version of ``get_s3()``."""
+        return self._request_sync("GET", "/user/s3")
 
     def sync_configure_blob(self, config: BlobStorageConfig) -> dict[str, Any]:
         """Synchronous version of ``configure_blob()``."""
@@ -1189,6 +1460,14 @@ class TornadoClient:
     def sync_delete_gcs(self) -> dict[str, Any]:
         """Synchronous version of ``delete_gcs()``."""
         return self._request_sync("DELETE", "/user/gcs")
+
+    def sync_configure_gdrive(self, config: GDriveStorageConfig) -> dict[str, Any]:
+        """Synchronous version of ``configure_gdrive()``."""
+        return self._request_sync("POST", "/user/gdrive", json=config.to_dict())
+
+    def sync_delete_gdrive(self) -> dict[str, Any]:
+        """Synchronous version of ``delete_gdrive()``."""
+        return self._request_sync("DELETE", "/user/gdrive")
 
     def sync_configure_oss(self, config: OssStorageConfig) -> dict[str, Any]:
         """Synchronous version of ``configure_oss()``."""
@@ -1230,3 +1509,13 @@ class TornadoClient:
     def sync_delete_slack(self) -> dict[str, Any]:
         """Synchronous version of ``delete_slack()``."""
         return self._request_sync("DELETE", "/user/slack")
+
+    def sync_get_webhook_secret(self) -> str:
+        """Synchronous version of ``get_webhook_secret()``. Returns the secret."""
+        data = self._request_sync("GET", "/user/webhook-secret")
+        return data.get("webhook_signing_secret", "")
+
+    def sync_rotate_webhook_secret(self) -> str:
+        """Synchronous version of ``rotate_webhook_secret()``. Returns the NEW secret."""
+        data = self._request_sync("POST", "/user/webhook-secret/rotate")
+        return data.get("webhook_signing_secret", "")

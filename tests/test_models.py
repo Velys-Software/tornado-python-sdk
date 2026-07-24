@@ -12,7 +12,9 @@ from tornado_sdk.models import (
     CreateBulkRequest,
     CreateJobRequest,
     GcsStorageConfig,
+    GDriveStorageConfig,
     InlineStorageConfig,
+    IsShortResponse,
     Job,
     JobStatus,
     MetadataResponse,
@@ -397,3 +399,200 @@ def test_create_job_request_repr_does_not_leak_inline_storage_secret():
         ),
     )
     assert "NESTED_SECRET" not in repr(req)
+
+
+# =============================================================================
+# Cancelled-job detection (the API has no "Cancelled" status)
+# =============================================================================
+
+
+def test_is_cancelled_detects_failed_with_cancelled_step():
+    """DELETE /jobs/:id persists Failed + step='Cancelled' — is_cancelled must see it."""
+    job = Job.from_dict(
+        {
+            "id": "x",
+            "url": "u",
+            "status": "Failed",
+            "step": "Cancelled",
+            "error": "Job cancelled by user",
+        }
+    )
+    assert job.is_cancelled
+    assert job.is_failed  # still a Failed status on the wire
+    assert job.is_terminal
+
+
+def test_is_cancelled_false_for_regular_failure():
+    """A normal failure (no Cancelled step) must not be flagged as cancelled."""
+    job = Job.from_dict({"id": "x", "url": "u", "status": "Failed", "error": "boom"})
+    assert not job.is_cancelled
+
+
+def test_is_cancelled_forward_compat_with_real_status():
+    """If the API ever returns a real 'Cancelled' status, is_cancelled still works."""
+    job = Job.from_dict({"id": "x", "url": "u", "status": "Cancelled"})
+    assert job.status == JobStatus.CANCELLED
+    assert job.is_cancelled
+
+
+# =============================================================================
+# Job response fields added for API parity
+# =============================================================================
+
+
+def test_job_parses_thumbnail_and_webhook_diagnostics():
+    """thumbnail_url + webhook_* diagnostics are returned by GET /jobs/:id."""
+    job = Job.from_dict(
+        {
+            "id": "x",
+            "url": "u",
+            "status": "Completed",
+            "thumbnail_url": "https://s3/thumb.jpg",
+            "webhook_status": "failed",
+            "webhook_attempts": 3,
+            "webhook_last_error": "HTTP 500",
+            "webhook_response_time_ms": 812,
+        }
+    )
+    assert job.thumbnail_url == "https://s3/thumb.jpg"
+    assert job.webhook_status == "failed"
+    assert job.webhook_attempts == 3
+    assert job.webhook_last_error == "HTTP 500"
+    assert job.webhook_response_time_ms == 812
+
+
+def test_job_s3_key_no_longer_reads_phantom_fallbacks():
+    """object_key/key/bucket/provider are never sent by the API — no aliasing."""
+    job = Job.from_dict(
+        {
+            "id": "x",
+            "url": "u",
+            "status": "Completed",
+            "object_key": "videos/a.mp4",
+            "bucket": "b",
+            "provider": "s3",
+        }
+    )
+    assert job.s3_key is None
+    assert job.s3_bucket is None
+    assert job.storage_provider is None
+
+
+# =============================================================================
+# BatchJob skipped_episodes (terminal batches can have skips)
+# =============================================================================
+
+
+def test_batch_job_parses_skipped_episodes():
+    """skipped_episodes is part of GET /batch/:id and must be deserialized."""
+    batch = BatchJob.from_dict(
+        {
+            "id": "b1",
+            "show_url": "https://open.spotify.com/show/x",
+            "status": "finished",
+            "total_episodes": 10,
+            "completed_episodes": 7,
+            "failed_episodes": 1,
+            "skipped_episodes": 2,
+        }
+    )
+    assert batch.skipped_episodes == 2
+    assert batch.done_episodes == 10
+    assert batch.progress_percent == 100.0
+    assert batch.is_terminal
+
+
+def test_batch_progress_counts_skipped_episodes():
+    """A batch with only skips in-flight must not under-report progress."""
+    batch = BatchJob.from_dict(
+        {
+            "id": "b1",
+            "show_url": "u",
+            "status": "processing",
+            "total_episodes": 4,
+            "completed_episodes": 1,
+            "failed_episodes": 1,
+            "skipped_episodes": 1,
+        }
+    )
+    assert batch.done_episodes == 3
+    assert batch.progress_percent == 75.0
+
+
+def test_batch_skipped_defaults_to_zero():
+    """Older payloads without skipped_episodes still deserialize."""
+    batch = BatchJob.from_dict({"id": "b1", "show_url": "u", "status": "processing"})
+    assert batch.skipped_episodes == 0
+
+
+# =============================================================================
+# IsShortResponse (POST /is-short)
+# =============================================================================
+
+
+def test_is_short_response_from_dict():
+    resp = IsShortResponse.from_dict(
+        {
+            "is_short": True,
+            "video_type": "short",
+            "width": 1080,
+            "height": 1920,
+            "aspect_ratio": 1.778,
+            "duration_seconds": 45,
+        }
+    )
+    assert resp.is_short
+    assert resp.video_type == "short"
+    assert resp.width == 1080
+    assert resp.height == 1920
+    assert resp.aspect_ratio == 1.778
+    assert resp.duration_seconds == 45
+
+
+def test_is_short_response_defaults():
+    resp = IsShortResponse.from_dict({})
+    assert not resp.is_short
+    assert resp.video_type == "video"
+    assert resp.duration_seconds == 0
+
+
+# =============================================================================
+# GDriveStorageConfig (POST /user/gdrive)
+# =============================================================================
+
+
+def test_gdrive_config_to_dict():
+    """folder_id is always sent (empty string = service account root)."""
+    cfg = GDriveStorageConfig(
+        service_account_json='{"type": "service_account"}',
+        folder_id="1AbC",
+        folder_prefix="podcasts/",
+    )
+    d = cfg.to_dict()
+    assert d["service_account_json"] == '{"type": "service_account"}'
+    assert d["folder_id"] == "1AbC"
+    assert d["folder_prefix"] == "podcasts/"
+    assert "base_folder" not in d
+
+
+def test_gdrive_config_defaults_and_redaction():
+    cfg = GDriveStorageConfig(service_account_json='{"private_key": "SECRET_PEM"}')
+    assert cfg.to_dict()["folder_id"] == ""
+    assert "SECRET_PEM" not in repr(cfg)
+
+
+# =============================================================================
+# BlobStorageConfig apply_to_all_keys (org-wide default storage)
+# =============================================================================
+
+
+def test_blob_config_apply_to_all_keys_omitted_by_default():
+    cfg = BlobStorageConfig(account_name="acct", container="c", account_key="k")
+    assert "apply_to_all_keys" not in cfg.to_dict()
+
+
+def test_blob_config_apply_to_all_keys_serialized_when_true():
+    cfg = BlobStorageConfig(
+        account_name="acct", container="c", sas_token="tok", apply_to_all_keys=True
+    )
+    assert cfg.to_dict()["apply_to_all_keys"] is True

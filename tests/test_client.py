@@ -917,3 +917,276 @@ def test_sync_context_manager_closes_sync_client():
         assert not c._sync_client.is_closed
     # After exiting the context manager, the sync client must be closed.
     assert c._sync_client.is_closed
+
+
+# =============================================================================
+# Idempotency key on POST /jobs (prevents duplicate jobs on retry)
+# =============================================================================
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_create_job_sends_idempotency_key(client):
+    """POST /jobs must carry an auto-generated x-idempotency-key header."""
+    route = respx.post(f"{BASE_URL}/jobs").mock(
+        return_value=httpx.Response(201, json={"job_id": "abc"})
+    )
+    await client.create_job("https://youtube.com/watch?v=abc")
+    sent = route.calls[0].request.headers.get("x-idempotency-key")
+    assert sent  # non-empty auto-generated key
+    await client.close()
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_create_job_idempotency_key_stable_across_retries(monkeypatch):
+    """The SAME key must be sent on the retry after a 5xx, so the server dedups."""
+
+    async def _no_sleep(_: float) -> None:
+        return None
+
+    import asyncio as _asyncio
+    monkeypatch.setattr(_asyncio, "sleep", _no_sleep)
+
+    c = TornadoClient(api_key="k", max_retries=1)
+    route = respx.post(f"{BASE_URL}/jobs").mock(
+        side_effect=[
+            httpx.Response(500, json={"error": "boom"}),
+            httpx.Response(201, json={"job_id": "ok", "cached": True}),
+        ]
+    )
+    job_id = await c.create_job("https://youtube.com/watch?v=abc")
+    assert job_id == "ok"
+    key_1 = route.calls[0].request.headers["x-idempotency-key"]
+    key_2 = route.calls[1].request.headers["x-idempotency-key"]
+    assert key_1 == key_2
+    await c.close()
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_create_job_explicit_idempotency_key(client):
+    """A caller-provided idempotency_key must be forwarded verbatim."""
+    route = respx.post(f"{BASE_URL}/jobs").mock(
+        return_value=httpx.Response(201, json={"job_id": "abc"})
+    )
+    await client.create_job(
+        "https://youtube.com/watch?v=abc", idempotency_key="my-key-42"
+    )
+    assert route.calls[0].request.headers["x-idempotency-key"] == "my-key-42"
+    await client.close()
+
+
+@respx.mock
+def test_sync_create_job_sends_idempotency_key():
+    """sync_create_job must also carry the idempotency header (popped from kwargs)."""
+    route = respx.post(f"{BASE_URL}/jobs").mock(
+        return_value=httpx.Response(201, json={"job_id": "abc"})
+    )
+    c = TornadoClient(api_key="k", max_retries=0)
+    c.sync_create_job("https://youtube.com/watch?v=abc", idempotency_key="sk-1")
+    assert route.calls[0].request.headers["x-idempotency-key"] == "sk-1"
+    c.sync_close()
+
+
+# =============================================================================
+# Error mapping refinements (422, literal-null bodies)
+# =============================================================================
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_422_maps_to_validation_error(client):
+    """axum JSON-deserialization rejections (422) are validation errors too."""
+    respx.post(f"{BASE_URL}/jobs").mock(
+        return_value=httpx.Response(
+            422, text="Failed to deserialize the JSON body: invalid value"
+        )
+    )
+    with pytest.raises(ValidationError) as exc_info:
+        await client.create_job("https://youtube.com/watch?v=abc")
+    assert exc_info.value.status_code == 422
+    await client.close()
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_null_error_body_does_not_leak_null_message(client):
+    """GET /jobs/:id returns a literal `null` body on 404 — message must be readable."""
+    respx.get(f"{BASE_URL}/jobs/unknown").mock(
+        return_value=httpx.Response(404, json=None)
+    )
+    with pytest.raises(NotFoundError) as exc_info:
+        await client.get_job("unknown")
+    assert exc_info.value.message == "HTTP 404"
+    assert "null" not in exc_info.value.message
+    await client.close()
+
+
+# =============================================================================
+# wait_for_batch counts skipped episodes in its fallback termination check
+# =============================================================================
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_wait_for_batch_fallback_counts_skipped(client):
+    """A stuck-'processing' batch whose episodes are all done (incl. skips) returns."""
+    respx.get(f"{BASE_URL}/batch/b1").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "b1",
+                "show_url": "u",
+                "status": "processing",  # status not yet flipped server-side
+                "total_episodes": 3,
+                "completed_episodes": 1,
+                "failed_episodes": 1,
+                "skipped_episodes": 1,
+            },
+        )
+    )
+    batch = await client.wait_for_batch("b1", poll_interval=0.0, timeout=5.0)
+    assert batch.done_episodes == 3
+    await client.close()
+
+
+# =============================================================================
+# New endpoints: /is-short, GET /user/s3, /user/gdrive, /user/webhook-secret
+# =============================================================================
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_is_short(client):
+    respx.post(f"{BASE_URL}/is-short").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "is_short": True,
+                "video_type": "short",
+                "width": 1080,
+                "height": 1920,
+                "aspect_ratio": 1.778,
+                "duration_seconds": 30,
+            },
+        )
+    )
+    resp = await client.is_short("https://youtube.com/shorts/abc")
+    assert resp.is_short
+    assert resp.video_type == "short"
+    await client.close()
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_get_s3(client):
+    respx.get(f"{BASE_URL}/user/s3").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "configured": True,
+                "provider": "s3",
+                "container_or_bucket": "my-bucket",
+                "access_key_masked": "****ABCD",
+                "source": "keyvault",
+            },
+        )
+    )
+    result = await client.get_s3()
+    assert result["configured"] is True
+    assert result["access_key_masked"] == "****ABCD"
+    await client.close()
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_configure_and_delete_gdrive(client):
+    from tornado_sdk import GDriveStorageConfig
+
+    route = respx.post(f"{BASE_URL}/user/gdrive").mock(
+        return_value=httpx.Response(
+            200, json={"message": "OK", "provider": "gdrive", "container_or_bucket": "1AbC"}
+        )
+    )
+    result = await client.configure_gdrive(
+        GDriveStorageConfig(service_account_json="{}", folder_id="1AbC")
+    )
+    assert result["provider"] == "gdrive"
+    import json as _json
+    sent = _json.loads(route.calls[0].request.content)
+    assert sent["folder_id"] == "1AbC"
+
+    respx.delete(f"{BASE_URL}/user/gdrive").mock(
+        return_value=httpx.Response(200, json={"message": "deleted"})
+    )
+    assert (await client.delete_gdrive())["message"] == "deleted"
+    await client.close()
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_webhook_secret_get_and_rotate(client):
+    respx.get(f"{BASE_URL}/user/webhook-secret").mock(
+        return_value=httpx.Response(200, json={"webhook_signing_secret": "whsec_old"})
+    )
+    assert await client.get_webhook_secret() == "whsec_old"
+
+    respx.post(f"{BASE_URL}/user/webhook-secret/rotate").mock(
+        return_value=httpx.Response(200, json={"webhook_signing_secret": "whsec_new"})
+    )
+    assert await client.rotate_webhook_secret() == "whsec_new"
+    await client.close()
+
+
+# =============================================================================
+# Webhook signature verification (X-Tornado-Signature: t=<ts>,v1=<hmac>)
+# =============================================================================
+
+
+def _sign(payload: bytes, secret: str, ts: int) -> str:
+    import hashlib as _hashlib
+    import hmac as _hmac
+
+    mac = _hmac.new(
+        secret.encode(), f"{ts}.".encode() + payload, _hashlib.sha256
+    ).hexdigest()
+    return f"t={ts},v1={mac}"
+
+
+def test_verify_webhook_signature_valid():
+    import time as _time
+
+    payload = b'{"event":"job_completed","job_id":"abc"}'
+    ts = int(_time.time())
+    header = _sign(payload, "whsec_test", ts)
+    assert TornadoClient.verify_webhook_signature(payload, header, "whsec_test")
+    # str payload works too
+    assert TornadoClient.verify_webhook_signature(payload.decode(), header, "whsec_test")
+
+
+def test_verify_webhook_signature_wrong_secret():
+    import time as _time
+
+    payload = b"{}"
+    header = _sign(payload, "whsec_test", int(_time.time()))
+    assert not TornadoClient.verify_webhook_signature(payload, header, "whsec_other")
+
+
+def test_verify_webhook_signature_stale_timestamp():
+    import time as _time
+
+    payload = b"{}"
+    old_ts = int(_time.time()) - 3600  # 1h old > 300s tolerance
+    header = _sign(payload, "whsec_test", old_ts)
+    assert not TornadoClient.verify_webhook_signature(payload, header, "whsec_test")
+    # tolerance disabled -> the same signature verifies
+    assert TornadoClient.verify_webhook_signature(
+        payload, header, "whsec_test", tolerance_seconds=0
+    )
+
+
+def test_verify_webhook_signature_malformed_header():
+    assert not TornadoClient.verify_webhook_signature(b"{}", "garbage", "whsec_test")
+    assert not TornadoClient.verify_webhook_signature(b"{}", "t=abc,v1=00", "whsec_test")
+    assert not TornadoClient.verify_webhook_signature(b"{}", "", "whsec_test")

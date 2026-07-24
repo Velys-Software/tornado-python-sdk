@@ -39,8 +39,10 @@ from tornado_sdk.models import (
     CreateBulkRequest,
     CreateJobRequest,
     GcsStorageConfig,
+    GDriveStorageConfig,
     # Inline storage credentials passed per-job (marketplace users)
     InlineStorageConfig,
+    IsShortResponse,
     Job,
     JobStatus,
     JobStep,
@@ -52,7 +54,7 @@ from tornado_sdk.models import (
     UsageResponse,
 )
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # Public API surface - everything importable via `from tornado_sdk import *`
 __all__ = [
@@ -67,11 +69,13 @@ __all__ = [
     "BulkJobItem",
     "BatchJob",
     "MetadataResponse",
+    "IsShortResponse",
     "UsageResponse",
     # Storage configs
     "S3StorageConfig",
     "BlobStorageConfig",
     "GcsStorageConfig",
+    "GDriveStorageConfig",
     "OssStorageConfig",
     "SlackWebhookConfig",
     "InlineStorageConfig",

@@ -7,9 +7,11 @@ provides a ``to_dict()`` method for serialization (request models) or a
 
 Models are grouped into:
     - Request models: CreateJobRequest, CreateBulkRequest, BulkJobItem
-    - Response models: Job, BatchJob, MetadataResponse, UsageResponse
+    - Response models: Job, BatchJob, MetadataResponse, UsageResponse,
+      IsShortResponse
     - Storage configs: S3StorageConfig, BlobStorageConfig, GcsStorageConfig,
-      OssStorageConfig, SlackWebhookConfig, InlineStorageConfig
+      GDriveStorageConfig, OssStorageConfig, SlackWebhookConfig,
+      InlineStorageConfig
 """
 
 from __future__ import annotations
@@ -60,8 +62,18 @@ class JobStatus(str, Enum):
     ``step`` field — see :class:`JobStep`.
 
     Lifecycle: ``Pending`` -> ``Processing`` -> a terminal state. Terminal
-    states are ``Completed``, ``Failed``, ``Warning`` and ``Skipped`` (plus
-    ``Cancelled`` when a job is cancelled via ``DELETE /jobs/:id``).
+    states are ``Completed``, ``Failed``, ``Warning`` and ``Skipped``.
+
+    .. note::
+        The API has **no** ``"Cancelled"`` status value. A job cancelled via
+        ``DELETE /jobs/:id`` is persisted as ``Failed`` with
+        ``step == "Cancelled"`` and ``error == "Job cancelled by user"``.
+        Immediately after cancellation the API's cache may even report the
+        job as ``Pending`` for up to ~24h — do NOT poll a job you just
+        cancelled (see :meth:`TornadoClient.cancel_job`). Use
+        :attr:`Job.is_cancelled` to detect a cancelled job.
+        ``CANCELLED`` is kept only for forward compatibility, should the API
+        introduce a real status later.
     """
 
     PENDING = "Pending"         # Queued, waiting for a worker to pick it up
@@ -70,7 +82,7 @@ class JobStatus(str, Enum):
     FAILED = "Failed"           # Terminal: failed - check error / error_type
     WARNING = "Warning"         # Terminal: content issue (private/geo-blocked/bot-detected)
     SKIPPED = "Skipped"         # Terminal: skipped (e.g. unprocessable content)
-    CANCELLED = "Cancelled"     # Terminal: cancelled by user via DELETE /jobs/:id
+    CANCELLED = "Cancelled"     # Forward-compat only: NOT currently returned by the API
     UNKNOWN = "Unknown"         # Sentinel for a status this SDK version doesn't recognize
 
 
@@ -367,9 +379,9 @@ class Job:
         PUBLIC fields.
 
         PUBLIC (stable):
-            id, url, status, s3_url, subtitle_url, error, error_type,
-            title, file_size, created_at, finished_at, folder, batch_id,
-            and the user-parameter echo block (filename, format,
+            id, url, status, s3_url, subtitle_url, thumbnail_url, error,
+            error_type, title, file_size, created_at, finished_at, folder,
+            batch_id, and the user-parameter echo block (filename, format,
             video_codec, audio_codec, audio_bitrate, video_quality,
             audio_only, download_subtitles, download_thumbnail,
             quality_preset, max_resolution, clip_start, clip_end,
@@ -381,7 +393,15 @@ class Job:
             step, all *_duration_ms / *_wait_ms / *_speed_mbps fields,
             download_strategy, cascade_total_attempts, native_video_codec,
             native_audio_codec, download_retries, upload_retries,
-            requested_quality, actual_quality, webhook_status.
+            requested_quality, actual_quality, webhook_status,
+            webhook_attempts, webhook_last_error, webhook_response_time_ms.
+
+    Endpoint asymmetry (important):
+        ``GET /jobs`` (list) items include the raw ``s3_key`` but NOT the
+        presigned ``s3_url`` / ``subtitle_url`` / ``thumbnail_url``.
+        ``GET /jobs/:id`` returns presigned URLs but NOT ``s3_key``.
+        To download a file found via ``list_jobs()``, call ``get_job(id)``
+        to obtain the presigned URL.
     """
 
     # -- PUBLIC: Core fields (always present) ---------------------------------
@@ -391,16 +411,17 @@ class Job:
 
     # -- PUBLIC: Output fields (populated on completion) ----------------------
     raw_status: Optional[str] = None         # Original status string from the API (set when status is UNKNOWN)
-    s3_url: Optional[str] = None             # Presigned download URL for the output file
-    # Real object key + bucket + provider, when the API returns them.
-    # The path encoded in the presigned ``s3_url`` may include extra prefixes
-    # (e.g. ``tornado/``) that do NOT match the actual object key in your
-    # bucket. Use these fields to derive sibling keys (sidecars, manifests)
-    # rather than parsing the presigned URL.
-    s3_key: Optional[str] = None             # PUBLIC — exact object key in the bucket
-    s3_bucket: Optional[str] = None          # PUBLIC — destination bucket name
-    storage_provider: Optional[str] = None   # PUBLIC — "s3" | "blob" | "gcs" | "oss" | ...
+    s3_url: Optional[str] = None             # Presigned download URL (GET /jobs/:id only, NOT list items)
+    # Raw object key in the destination bucket. ONLY returned in `GET /jobs`
+    # (list) items — `GET /jobs/:id` returns the presigned `s3_url` instead.
+    s3_key: Optional[str] = None             # Exact object key (list_jobs items only)
+    # DEPRECATED: the API does not currently return these two fields on any
+    # endpoint — they are always None. Kept so existing code doesn't break;
+    # they will be populated if the API starts returning them.
+    s3_bucket: Optional[str] = None          # DEPRECATED — never returned by the current API
+    storage_provider: Optional[str] = None   # DEPRECATED — never returned by the current API
     subtitle_url: Optional[str] = None       # Presigned URL for subtitle file (if requested)
+    thumbnail_url: Optional[str] = None      # Presigned URL for thumbnail (if download_thumbnail was set)
     error: Optional[str] = None              # Error message (if failed)
     error_type: Optional[str] = None         # "error" for technical, "warning" for content issues
     step: Optional[str] = None               # INTERNAL — current pipeline step description (UI hint)
@@ -434,7 +455,10 @@ class Job:
     queue_wait_ms: Optional[int] = None            # INTERNAL
     requested_quality: Optional[str] = None        # INTERNAL
     actual_quality: Optional[str] = None           # INTERNAL
-    webhook_status: Optional[str] = None           # INTERNAL
+    webhook_status: Optional[str] = None           # INTERNAL — "delivered" | "failed" | "no_webhook"
+    webhook_attempts: Optional[int] = None         # INTERNAL — delivery attempts for the outcome webhook
+    webhook_last_error: Optional[str] = None       # INTERNAL — last delivery error (when status is "failed")
+    webhook_response_time_ms: Optional[int] = None # INTERNAL — webhook endpoint response time
     # PUBLIC timestamps
     created_at: Optional[int] = None               # PUBLIC — epoch ms
     finished_at: Optional[int] = None              # PUBLIC — epoch ms
@@ -488,10 +512,11 @@ class Job:
             status=status,
             raw_status=raw_status,
             s3_url=data.get("s3_url"),
-            s3_key=data.get("s3_key") or data.get("object_key") or data.get("key"),
-            s3_bucket=data.get("s3_bucket") or data.get("bucket"),
-            storage_provider=data.get("storage_provider") or data.get("provider"),
+            s3_key=data.get("s3_key"),
+            s3_bucket=data.get("s3_bucket"),
+            storage_provider=data.get("storage_provider"),
             subtitle_url=data.get("subtitle_url"),
+            thumbnail_url=data.get("thumbnail_url"),
             error=data.get("error"),
             error_type=data.get("error_type"),
             step=data.get("step"),
@@ -520,6 +545,9 @@ class Job:
             requested_quality=data.get("requested_quality"),
             actual_quality=data.get("actual_quality"),
             webhook_status=data.get("webhook_status"),
+            webhook_attempts=data.get("webhook_attempts"),
+            webhook_last_error=data.get("webhook_last_error"),
+            webhook_response_time_ms=data.get("webhook_response_time_ms"),
             created_at=data.get("created_at"),
             finished_at=data.get("finished_at"),
             description=data.get("description"),
@@ -573,8 +601,16 @@ class Job:
 
     @property
     def is_cancelled(self) -> bool:
-        """True if the job was cancelled by the user."""
-        return self.status == JobStatus.CANCELLED
+        """True if the job was cancelled by the user.
+
+        The API has no dedicated "Cancelled" status: a cancelled job is
+        persisted as ``Failed`` with ``step == "Cancelled"`` (and error
+        "Job cancelled by user"). This property detects that fingerprint,
+        plus a real ``Cancelled`` status should the API introduce one.
+        """
+        if self.status == JobStatus.CANCELLED:
+            return True  # forward compatibility
+        return self.status == JobStatus.FAILED and self.step == "Cancelled"
 
     @property
     def is_terminal(self) -> bool:
@@ -609,6 +645,7 @@ class BatchJob:
     total_episodes: int = 0                        # Total number of episodes in the batch
     completed_episodes: int = 0                    # Episodes that finished successfully
     failed_episodes: int = 0                       # Episodes that failed
+    skipped_episodes: int = 0                      # Episodes that were skipped (unprocessable)
     episode_jobs: list[str] = field(default_factory=list)  # List of individual job UUIDs
 
     @classmethod
@@ -622,17 +659,23 @@ class BatchJob:
             total_episodes=data.get("total_episodes", 0),
             completed_episodes=data.get("completed_episodes", 0),
             failed_episodes=data.get("failed_episodes", 0),
+            skipped_episodes=data.get("skipped_episodes", 0),
             episode_jobs=data.get("episode_jobs", []),
         )
 
     @property
     def is_completed(self) -> bool:
-        """True if every episode succeeded (batch status 'completed')."""
+        """True if every episode succeeded (batch status 'completed').
+
+        The API only reports 'completed' when there are zero failed AND
+        zero skipped episodes; otherwise the terminal status is 'finished'.
+        """
         return self.status == "completed"
 
     @property
     def is_finished(self) -> bool:
-        """True if the batch is done but some episodes failed (status 'finished').
+        """True if the batch is done but some episodes failed or were skipped
+        (status 'finished').
 
         Like 'completed', this is a terminal state — no episodes are still running.
         """
@@ -644,15 +687,20 @@ class BatchJob:
         return self.status in ("completed", "finished")
 
     @property
+    def done_episodes(self) -> int:
+        """Number of episodes in a terminal state (completed + failed + skipped)."""
+        return self.completed_episodes + self.failed_episodes + self.skipped_episodes
+
+    @property
     def progress_percent(self) -> float:
         """Overall batch progress as a percentage (0.0 - 100.0).
 
-        Includes both completed and failed episodes in the numerator,
-        since failed episodes are also "done" from a progress perspective.
+        Includes completed, failed AND skipped episodes in the numerator,
+        since all three are "done" from a progress perspective.
         """
         if self.total_episodes == 0:
             return 0.0
-        return (self.completed_episodes + self.failed_episodes) / self.total_episodes * 100
+        return self.done_episodes / self.total_episodes * 100
 
 
 @dataclass
@@ -692,6 +740,34 @@ class MetadataResponse:
             like_count=data.get("like_count"),
             upload_date=data.get("upload_date"),
             filesize_approx=data.get("filesize_approx"),
+        )
+
+
+@dataclass
+class IsShortResponse:
+    """Response of POST /is-short — YouTube Short detection by aspect ratio.
+
+    A video is classified as a "short" when its best format is vertical
+    (height > width). No download is performed.
+    """
+
+    is_short: bool = False                # True when the video is vertical
+    video_type: str = "video"             # "short", "video", or "live"
+    width: Optional[int] = None           # Best format width in pixels
+    height: Optional[int] = None          # Best format height in pixels
+    aspect_ratio: Optional[float] = None  # height / width; > 1.0 means vertical
+    duration_seconds: int = 0             # Video duration in seconds
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> IsShortResponse:
+        """Deserialize from the API JSON response."""
+        return cls(
+            is_short=data.get("is_short", False),
+            video_type=data.get("video_type", "video"),
+            width=data.get("width"),
+            height=data.get("height"),
+            aspect_ratio=data.get("aspect_ratio"),
+            duration_seconds=data.get("duration_seconds", 0),
         )
 
 
@@ -802,6 +878,13 @@ class BlobStorageConfig:
         sas_token: SAS token for scoped access (mutually exclusive with account_key).
         folder_prefix: Optional folder prefix for all uploads.
         base_folder: Base folder for organizing uploads (default: "videos").
+        apply_to_all_keys: When True, save this config as the
+            **organization-wide default** storage instead of only this API
+            key. Every key in the org without its own storage config —
+            including keys created later — will deliver to this container.
+            A key with its own config keeps it (per-key override wins).
+            Requires the calling API key to belong to an organization
+            (otherwise the API returns 400). Default: False.
     """
 
     account_name: str
@@ -810,6 +893,7 @@ class BlobStorageConfig:
     sas_token: Optional[str] = field(default=None, repr=False)    # secret
     folder_prefix: Optional[str] = None
     base_folder: Optional[str] = None
+    apply_to_all_keys: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to API payload."""
@@ -825,6 +909,8 @@ class BlobStorageConfig:
             d["folder_prefix"] = self.folder_prefix
         if self.base_folder is not None:
             d["base_folder"] = self.base_folder
+        if self.apply_to_all_keys:
+            d["apply_to_all_keys"] = True
         return d
 
 
@@ -854,6 +940,40 @@ class GcsStorageConfig:
             "project_id": self.project_id,
             "bucket": self.bucket,
             "service_account_json": self.service_account_json,
+        }
+        if self.folder_prefix is not None:
+            d["folder_prefix"] = self.folder_prefix
+        if self.base_folder is not None:
+            d["base_folder"] = self.base_folder
+        return d
+
+
+@dataclass
+class GDriveStorageConfig:
+    """Google Drive delivery configuration.
+
+    Configured via POST /user/gdrive. Files are uploaded to the given Drive
+    folder using a service account. Share the target folder with the service
+    account's email address so it has write access.
+
+    Args:
+        service_account_json: Full service account JSON key file content as a string.
+        folder_id: Target Drive folder ID (empty string = the service
+            account's own root). Default: "".
+        folder_prefix: Optional folder prefix for all uploads.
+        base_folder: Base folder for organizing uploads (default: "videos").
+    """
+
+    service_account_json: str = field(repr=False)  # secret — full private key JSON
+    folder_id: str = ""
+    folder_prefix: Optional[str] = None
+    base_folder: Optional[str] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to API payload."""
+        d: dict[str, Any] = {
+            "service_account_json": self.service_account_json,
+            "folder_id": self.folder_id,
         }
         if self.folder_prefix is not None:
             d["folder_prefix"] = self.folder_prefix
