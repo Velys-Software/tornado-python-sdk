@@ -85,9 +85,11 @@ print(f"Download URL: {job.s3_url}")
 - **Subtitle Downloads** — Extract subtitles alongside video files
 - **Metadata Extraction** — Get video info (title, duration, resolution) without downloading
 - **Auto-Retry** — Automatic retry with exponential backoff on rate limits (429) and server errors (5xx)
+- **Idempotent Job Creation** — Every `create_job()` carries an `x-idempotency-key`, so retries can never create duplicate jobs
 - **Type-Safe** — Full type hints and dataclass models
-- **Webhooks** — Completion, progress, and failure notifications
+- **Webhooks** — Completion, progress, and failure notifications — with HMAC signature verification (`verify_webhook_signature`)
 - **Slack Notifications** — Get alerted on job failures via Slack webhooks
+- **Shorts Detection** — `is_short()` classifies a YouTube URL (short/video/live) without downloading
 
 ## Supported Platforms
 
@@ -168,9 +170,11 @@ for job_id in job_ids:
     print(job_id, job.s3_url)
 ```
 
-> ⚠️ The server-side `create_bulk_jobs()` (`POST /jobs/bulk`) is designed for
-> **Spotify show batches**. For non-Spotify URLs the IDs it returns are **not**
-> addressable via `get_job()` — use `bulk_youtube_jobs()` for YouTube/TikTok/etc.
+> ⚠️ The server-side `create_bulk_jobs()` (`POST /jobs/bulk`) returns regular
+> `job_ids` (addressable via `get_job()`), but its `batch_id` is a grouping
+> label only — `get_batch()` / `wait_for_batch()` / `start_batch()` return 404
+> for it, and per-job webhooks / inline storage / `paused` mode are not
+> supported in bulk. Prefer `bulk_youtube_jobs()` when you need those options.
 
 ### Spotify Podcast Downloader (Batch)
 
@@ -206,9 +210,13 @@ meta = await client.get_metadata("https://youtube.com/watch?v=...")
 print(f"Title: {meta.title}")
 print(f"Duration: {meta.duration}s")
 print(f"Resolution: {meta.width}x{meta.height}")
+
+# YouTube Shorts detection (aspect-ratio based, no download)
+short = await client.is_short("https://youtube.com/shorts/...")
+print(short.is_short, short.video_type)  # True "short"
 ```
 
-### Cloud Storage Configuration (S3, Azure, GCS, R2)
+### Cloud Storage Configuration (S3, Azure, GCS, GDrive, R2)
 
 ```python
 from tornado_sdk import S3StorageConfig, BlobStorageConfig, InlineStorageConfig
@@ -221,6 +229,9 @@ await client.configure_s3(S3StorageConfig(
     access_key="...",
     secret_key="...",
 ))
+
+# Inspect what's configured (secrets are masked server-side)
+print(await client.get_s3())  # {"configured": True, "container_or_bucket": ...}
 
 # Or pass inline storage credentials per-job (for marketplace users)
 job_id = await client.create_job(
@@ -241,6 +252,25 @@ job_id = await client.create_job(
 usage = await client.get_usage()
 print(f"Jobs: {usage.usage_count}")
 print(f"Storage: {usage.storage_usage_gb:.2f} GB")
+```
+
+### Webhook Signature Verification
+
+Outcome webhooks are signed with an `X-Tornado-Signature` header
+(`t=<unix_ts>,v1=<hmac_sha256>`). Verify them with your signing secret:
+
+```python
+secret = await client.get_webhook_secret()  # "whsec_..." (create once, store it)
+
+# In your webhook receiver (use the EXACT raw request body):
+is_valid = TornadoClient.verify_webhook_signature(
+    payload=raw_body_bytes,
+    signature_header=request.headers["X-Tornado-Signature"],
+    secret=secret,
+)
+
+# Rotate the secret at any time (old signatures stop matching immediately)
+new_secret = await client.rotate_webhook_secret()
 ```
 
 ## Error Handling
